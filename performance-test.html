@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TeBot Performance Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .test-container { margin: 20px 0; padding: 15px; border: 1px solid #ccc; }
+        button { padding: 10px 15px; margin: 5px; }
+        .results { background-color: #f0f0f0; padding: 10px; margin: 10px 0; }
+        .fast { color: green; }
+        .slow { color: red; }
+    </style>
+</head>
+<body>
+    <h1>TeBot Performance Tester</h1>
+    
+    <div class="test-container">
+        <h3>Connection Status</h3>
+        <button onclick="connect()">Connect</button>
+        <button onclick="disconnect()">Disconnect</button>
+        <p>Status: <span id="status">Disconnected</span></p>
+    </div>
+
+    <div class="test-container">
+        <h3>Performance Tests</h3>
+        <button onclick="testSingleSend()">Single LED Command</button>
+        <button onclick="testRapidFire()">Rapid Fire (10 commands)</button>
+        <button onclick="testBurst()">Burst Test (50 commands)</button>
+        <button onclick="testContinuous()">Continuous Test (100 commands)</button>
+        <button onclick="stopTests()">Stop Tests</button>
+    </div>
+
+    <div class="test-container">
+        <h3>Results</h3>
+        <div id="results" class="results">
+            Ready to test...
+        </div>
+        <button onclick="clearResults()">Clear Results</button>
+    </div>
+
+    <script>
+        let socket = null;
+        let isConnected = false;
+        let testRunning = false;
+        let sentCount = 0;
+        let startTime = 0;
+
+        function log(message, isSuccess = true) {
+            const results = document.getElementById('results');
+            const time = new Date().toLocaleTimeString();
+            const className = isSuccess ? 'fast' : 'slow';
+            results.innerHTML += `<div class="${className}">[${time}] ${message}</div>`;
+            results.scrollTop = results.scrollHeight;
+        }
+
+        function connect() {
+            try {
+                socket = new WebSocket('ws://localhost:5000');
+                
+                socket.onopen = function() {
+                    isConnected = true;
+                    document.getElementById('status').textContent = 'Connected';
+                    log('✅ Connected to TeBot server');
+                };
+                
+                socket.onclose = function() {
+                    isConnected = false;
+                    document.getElementById('status').textContent = 'Disconnected';
+                    log('❌ Disconnected from TeBot server', false);
+                };
+                
+                socket.onerror = function(error) {
+                    log(`❌ WebSocket error: ${error}`, false);
+                };
+                
+            } catch (error) {
+                log(`❌ Connection failed: ${error}`, false);
+            }
+        }
+
+        function disconnect() {
+            if (socket) {
+                socket.close();
+                socket = null;
+            }
+        }
+
+        function sendLEDCommand(pattern = 0x1F) {
+            if (!isConnected || !socket) {
+                log('❌ Not connected', false);
+                return false;
+            }
+            
+            // Create 6-byte LED command: [0x07, pattern, pattern, pattern, pattern, pattern]
+            const data = new Uint8Array([0x07, pattern, pattern, pattern, pattern, pattern]);
+            
+            try {
+                const sendTime = performance.now();
+                socket.send(data);
+                const duration = performance.now() - sendTime;
+                
+                if (duration < 1) {
+                    log(`✅ Sent LED command in ${duration.toFixed(2)}ms`);
+                } else {
+                    log(`⚠️ Sent LED command in ${duration.toFixed(2)}ms (slow)`, false);
+                }
+                return true;
+            } catch (error) {
+                log(`❌ Send failed: ${error}`, false);
+                return false;
+            }
+        }
+
+        function testSingleSend() {
+            log('🧪 Testing single LED command...');
+            sendLEDCommand(0x15); // Checkerboard pattern
+        }
+
+        function testRapidFire() {
+            log('🧪 Testing rapid fire (10 commands)...');
+            sentCount = 0;
+            startTime = performance.now();
+            
+            for (let i = 0; i < 10; i++) {
+                setTimeout(() => {
+                    if (sendLEDCommand(i % 32)) {
+                        sentCount++;
+                        if (sentCount === 10) {
+                            const totalTime = performance.now() - startTime;
+                            const avgTime = totalTime / 10;
+                            log(`🎯 Rapid fire completed: ${totalTime.toFixed(2)}ms total, ${avgTime.toFixed(2)}ms average`);
+                        }
+                    }
+                }, i * 10); // 10ms intervals
+            }
+        }
+
+        function testBurst() {
+            log('🧪 Testing burst (50 commands)...');
+            sentCount = 0;
+            startTime = performance.now();
+            
+            for (let i = 0; i < 50; i++) {
+                setTimeout(() => {
+                    if (sendLEDCommand(i % 32)) {
+                        sentCount++;
+                        if (sentCount === 50) {
+                            const totalTime = performance.now() - startTime;
+                            const avgTime = totalTime / 50;
+                            log(`🎯 Burst test completed: ${totalTime.toFixed(2)}ms total, ${avgTime.toFixed(2)}ms average`);
+                        }
+                    }
+                }, i * 5); // 5ms intervals
+            }
+        }
+
+        function testContinuous() {
+            if (testRunning) {
+                log('❌ Test already running', false);
+                return;
+            }
+            
+            log('🧪 Testing continuous (100 commands)...');
+            testRunning = true;
+            sentCount = 0;
+            startTime = performance.now();
+            
+            const interval = setInterval(() => {
+                if (!testRunning || sentCount >= 100) {
+                    clearInterval(interval);
+                    testRunning = false;
+                    
+                    if (sentCount > 0) {
+                        const totalTime = performance.now() - startTime;
+                        const avgTime = totalTime / sentCount;
+                        const commandsPerSecond = (sentCount / totalTime * 1000).toFixed(1);
+                        log(`🎯 Continuous test completed: ${sentCount} commands in ${totalTime.toFixed(2)}ms`);
+                        log(`📊 Performance: ${avgTime.toFixed(2)}ms average, ${commandsPerSecond} commands/second`);
+                    }
+                    return;
+                }
+                
+                if (sendLEDCommand(sentCount % 32)) {
+                    sentCount++;
+                }
+            }, 20); // 20ms intervals (50 Hz)
+        }
+
+        function stopTests() {
+            testRunning = false;
+            log('🛑 Tests stopped');
+        }
+
+        function clearResults() {
+            document.getElementById('results').innerHTML = 'Results cleared...<br>';
+        }
+
+        // Auto-connect on page load
+        window.onload = function() {
+            log('TeBot Performance Tester loaded');
+            log('Click Connect to start testing');
+        };
+    </script>
+</body>
+</html>

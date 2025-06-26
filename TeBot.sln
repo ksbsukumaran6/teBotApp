@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.35826.135
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TeBot", "TeBot\TeBot.csproj", "{3EADCA49-B2A8-4567-92C2-1187EE4DF66A}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{3EADCA49-B2A8-4567-92C2-1187EE4DF66A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3EADCA49-B2A8-4567-92C2-1187EE4DF66A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3EADCA49-B2A8-4567-92C2-1187EE4DF66A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3EADCA49-B2A8-4567-92C2-1187EE4DF66A}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {84B54861-AD85-46FA-BCF1-0AD5955982E5}
+	EndGlobalSection
+EndGlobal

@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Test Client</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .container { max-width: 600px; }
+        .section { margin: 20px 0; padding: 15px; border: 1px solid #ccc; }
+        button { padding: 10px 15px; margin: 5px; }
+        input[type="text"] { width: 300px; padding: 5px; }
+        #output { height: 200px; overflow-y: scroll; border: 1px solid #ccc; padding: 10px; background-color: #f9f9f9; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>WebSocket Test Client for TeBot</h1>
+        
+        <div class="section">
+            <h3>Connection</h3>
+            <input type="text" id="serverUrl" value="ws://localhost:5000" placeholder="Server URL">
+            <button onclick="connect()">Connect</button>
+            <button onclick="disconnect()">Disconnect</button>
+            <p>Status: <span id="status">Disconnected</span></p>
+        </div>
+
+        <div class="section">
+            <h3>Send Data</h3>
+            <input type="text" id="textMessage" placeholder="Text message" value="Hello from WebSocket!">
+            <button onclick="sendText()">Send Text</button>
+            <br><br>
+            <button onclick="sendBinaryData()">Send Binary Data (Uint8Array)</button>
+            <button onclick="sendRandomData()">Send Random Uint8Array</button>
+        </div>
+
+        <div class="section">
+            <h3>Output</h3>
+            <div id="output"></div>
+            <button onclick="clearOutput()">Clear</button>
+        </div>
+    </div>
+
+    <script>
+        let socket = null;
+
+        function log(message) {
+            const output = document.getElementById('output');
+            const time = new Date().toLocaleTimeString();
+            output.innerHTML += `[${time}] ${message}<br>`;
+            output.scrollTop = output.scrollHeight;
+        }
+
+        function connect() {
+            const url = document.getElementById('serverUrl').value;
+            
+            try {
+                socket = new WebSocket(url);
+                
+                socket.onopen = function(event) {
+                    document.getElementById('status').textContent = 'Connected';
+                    log('Connected to server');
+                };
+                
+                socket.onmessage = function(event) {
+                    log(`Received: ${event.data}`);
+                };
+                
+                socket.onclose = function(event) {
+                    document.getElementById('status').textContent = 'Disconnected';
+                    log('Disconnected from server');
+                };
+                
+                socket.onerror = function(error) {
+                    log(`Error: ${error}`);
+                };
+                
+            } catch (error) {
+                log(`Connection error: ${error}`);
+            }
+        }
+
+        function disconnect() {
+            if (socket) {
+                socket.close();
+                socket = null;
+            }
+        }
+
+        function sendText() {
+            if (!socket || socket.readyState !== WebSocket.OPEN) {
+                log('Not connected to server');
+                return;
+            }
+            
+            const message = document.getElementById('textMessage').value;
+            // Convert text to Uint8Array
+            const encoder = new TextEncoder();
+            const data = encoder.encode(message);
+            
+            socket.send(data);
+            log(`Sent text as Uint8Array: "${message}" (${data.length} bytes)`);
+        }
+
+        function sendBinaryData() {
+            if (!socket || socket.readyState !== WebSocket.OPEN) {
+                log('Not connected to server');
+                return;
+            }
+            
+            // Create sample Uint8Array data
+            const data = new Uint8Array([0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0x42, 0x6C, 0x75, 0x65, 0x74, 0x6F, 0x6F, 0x74, 0x68, 0x21]); // "Hello Bluetooth!" in ASCII
+            
+            socket.send(data);
+            log(`Sent binary data: [${Array.from(data).map(b => '0x' + b.toString(16).padStart(2, '0')).join(', ')}] (${data.length} bytes)`);
+        }
+
+        function sendRandomData() {
+            if (!socket || socket.readyState !== WebSocket.OPEN) {
+                log('Not connected to server');
+                return;
+            }
+            
+            // Create random Uint8Array data
+            const length = Math.floor(Math.random() * 20) + 5; // 5-25 bytes
+            const data = new Uint8Array(length);
+            for (let i = 0; i < length; i++) {
+                data[i] = Math.floor(Math.random() * 256);
+            }
+            
+            socket.send(data);
+            log(`Sent random data: [${Array.from(data).map(b => '0x' + b.toString(16).padStart(2, '0')).join(', ')}] (${data.length} bytes)`);
+        }
+
+        function clearOutput() {
+            document.getElementById('output').innerHTML = '';
+        }
+
+        // Auto-connect on page load for convenience
+        window.onload = function() {
+            log('WebSocket test client loaded. Click Connect to start.');
+        };
+    </script>
+</body>
+</html>

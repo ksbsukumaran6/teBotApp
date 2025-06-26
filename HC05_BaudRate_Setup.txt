@@ -1,0 +1,40 @@
+HC-05 Bluetooth Module Baud Rate Configuration
+==============================================
+
+To set your HC-05 to 115200 baud rate, you need to:
+
+1. PHYSICAL SETUP:
+   - Connect HC-05 to Arduino or USB-TTL converter
+   - Power on HC-05 while holding the small button (enters AT command mode)
+   - LED should blink slowly (2 seconds on/off) indicating AT mode
+
+2. AT COMMANDS (send these via serial terminal):
+   - AT                    (should respond "OK")
+   - AT+UART=115200,0,0   (sets baud to 115200, no parity, 1 stop bit)
+   - AT+NAME=YourRobotName (optional: set a custom name)
+   - AT+RESET             (restart with new settings)
+
+3. VERIFICATION:
+   - Reconnect at 115200 baud
+   - Send "AT" - should get "OK"
+
+4. ARDUINO CODE EXAMPLE:
+   ```cpp
+   // After setting HC-05 to 115200
+   void setup() {
+     Serial.begin(9600);      // For PC communication
+     Serial1.begin(115200);   // For HC-05 communication
+   }
+   ```
+
+IMPORTANT NOTES:
+- Once set to 115200, you MUST communicate with HC-05 at 115200 baud
+- The C# application will automatically work at whatever speed the HC-05 is configured for
+- 115200 is 12x faster than 9600, so expect much better performance!
+
+COMMON HC-05 BAUD RATES:
+- 9600 (default)
+- 38400
+- 57600  
+- 115200 (recommended maximum)
+- 230400 (some modules support this)
