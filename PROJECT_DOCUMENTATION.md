@@ -8,10 +8,13 @@ TeBot is a C# WinForms application that acts as a bridge between Scratch program
 
 - **WebSocket Server**: Receives binary data from Scratch extensions
 - **Bluetooth Communication**: Connects to HC-05 modules at 115200 baud rate
-- **Multi-mode Operation**: Normal, Continuous, and Listen-only modes
+- **Multi-mode Operation**: Normal, Continuous (500ms intervals), and Listen-only modes
 - **Real-time Data Processing**: Handles 8-byte data packets with minimal latency
 - **Robust Error Handling**: Connection recovery and health monitoring
 - **User-friendly Interface**: WinForms GUI with real-time status updates
+- **External Bluetooth Adapter Support**: Auto-detection and preference for USB dongles
+- **Device Management**: Built-in pairing/unpairing with PIN support
+- **Master-Slave Architecture**: Clear communication protocol and role identification
 
 ## Architecture Overview
 
@@ -214,7 +217,7 @@ end
 
 #### 2. Continuous Mode
 - Sends marker (0xAA, 0x55) + 10 packets (82 bytes total)
-- Transmission interval: 200ms
+- Transmission interval: 500ms
 - Optimized for bulk data transfer
 
 #### 3. Listen-Only Mode
@@ -316,19 +319,27 @@ end
 │ WebSocket Server                                                        │
 │ [Start Server] [Stop Server]                                          │
 │                                                                        │
-│ Bluetooth                                      Data packets sent: 0    │
+│ Bluetooth Adapter Management                                           │
+│ Bluetooth Adapter: [Adapter Dropdown ▼] [Refresh Adapters]           │
+│ Selected: 🔥 TP-Link USB Dongle AC600T2U (00:11:22:33:44:55)          │
+│                                                                        │
+│ Device Pairing & Connection                    Data packets sent: 0    │
 │ [Scan Devices] [Test Multiple Arrays]                                 │
 │                                                                        │
 │ Available Devices:                                                     │
 │ [Device Dropdown ▼] [Connect] [Disconnect]                           │
+│ Pairing PIN: [____] [🔗 Pair Device] [🔓 Unpair Device]               │
 │                                                                        │
+│ Operating Modes (500ms intervals)                                      │
 │ [Start Continuous] [Stop Continuous] [Start Listen] [Stop Listen]     │
 │                                                                        │
 │ Status:                                                                │
 │ ┌─────────────────────────────────────────────────────────────────┐   │
 │ │ [Multi-line status text area with scroll]                      │   │
-│ │                                                                 │   │
-│ │                                                                 │   │
+│ │ [16:59:47] Started continuous transmission mode (10 packets    │   │
+│ │            every 500ms)                                        │   │
+│ │ [16:59:47] MASTER: Sending 82-byte command #1...              │   │
+│ │ [16:59:47] ✅ MASTER: Received 82-byte slave response          │   │
 │ └─────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -394,7 +405,7 @@ state ListenOnlyMode {
 | 82-byte continuous block | ~7ms | Marker + 10 packets |
 | Response timeout | 500ms | Maximum wait time |
 | Transmission interval | 100ms | Between packets |
-| Continuous interval | 200ms | Between blocks |
+| Continuous interval | 500ms | Between blocks |
 
 ### Memory Usage
 
@@ -424,7 +435,7 @@ DR -> DR: Continuous read loop
 
 alt Continuous Mode
     UI -> CT: Start Continuous Timer
-    CT -> CT: Send blocks every 200ms
+    CT -> CT: Send blocks every 500ms
     UI -> TT: Stop normal transmission
 end
 

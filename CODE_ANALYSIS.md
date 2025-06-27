@@ -373,7 +373,7 @@ private const int INTER_BYTE_DELAY_MS = 0;               // No delay at high bau
 |-----------|-----------|-------------|-------------|
 | Transmission Interval | 500ms | 100ms | 5x faster |
 | Response Timeout | 2000ms | 500ms | 4x faster |
-| Continuous Interval | 1000ms | 200ms | 5x faster |
+| Continuous Interval | 1000ms | 500ms | 2x faster |
 | Inter-byte Delay | 2ms | 0ms | Eliminated |
 | Read Timeout | 3000ms | 1000ms | 3x faster |
 

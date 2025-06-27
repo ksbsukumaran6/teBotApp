@@ -23,10 +23,11 @@ By participating in this project, you agree to abide by our code of conduct:
 
 ### Prerequisites
 - Windows 10/11 with Bluetooth support
-- Visual Studio 2019+ or Visual Studio Code
+- Visual Studio 2019+ or Visual Studio Code  
 - .NET Framework 4.8 or later
 - Git for version control
 - HC-05 Bluetooth module for testing (recommended)
+- External USB Bluetooth dongle (TP-Link recommended for best performance)
 
 ### Development Setup
 
@@ -155,10 +156,12 @@ public async Task<bool> SendDataAsync(byte[] data)
    - Window closing behavior
 
 ### Performance Testing
-- Test high-frequency data transmission
+- Test high-frequency data transmission at 500ms intervals
 - Monitor memory usage during long sessions
 - Verify no memory leaks in continuous mode
 - Check response times at 115200 baud
+- Validate stable operation with external Bluetooth dongles
+- Test master-slave communication reliability over extended periods
 
 ## Pull Request Process
 
