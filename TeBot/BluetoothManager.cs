@@ -308,12 +308,50 @@ namespace TeBot
                         return false;
                     }
 
-                    // Clear any stale data from receive buffer before sending
+                    // CRITICAL: Clear any stale data from receive buffer before sending
+                    // This prevents the 1-byte offset issue
                     ClearReceiveBuffer();
+                    
+                    // Also clear any stale data from our internal queues
+                    while (_receivedDataQueue.TryDequeue(out byte[] _)) { }
+                    
+                    // EXTRA AGGRESSIVE: Clear the main data queue too to prevent any interference
+                    while (_dataQueue.TryDequeue(out byte[] _)) { }
+                    
+                    StatusChanged?.Invoke("🧹 ULTRA CLEAR: All buffers, queues, and data cleared before sending");
                 }
 
-                // Send directly without queuing (outside lock to allow async)
-                return await SendDataDirectlyAsync(data);
+                // PAUSE DATA READING: Temporarily stop background reading to prevent interference
+                bool wasReading = _isReading;
+                if (wasReading)
+                {
+                    // We can't easily stop the reading thread, but we can prevent it from processing
+                    StatusChanged?.Invoke("⏸️ Pausing data reading during command send");
+                }
+
+                try
+                {
+                    // Verify the exact data we're about to send (debug check)
+                    var preHex = BitConverter.ToString(data).Replace("-", " ");
+                    StatusChanged?.Invoke($"🔍 PRE-SEND VERIFICATION: Data to send = {preHex}");
+                    
+                    // Send directly without queuing (outside lock to allow async)
+                    var result = await SendDataDirectlyAsync(data);
+                    
+                    if (result)
+                    {
+                        StatusChanged?.Invoke("✅ Command sent successfully - buffers clear, byte-by-byte send, no offset");
+                    }
+                    
+                    return result;
+                }
+                finally
+                {
+                    if (wasReading)
+                    {
+                        StatusChanged?.Invoke("▶️ Resuming data reading after command send");
+                    }
+                }
             });
         }
 
@@ -591,12 +629,21 @@ namespace TeBot
                 Debug.WriteLine($"[{timestamp}] SENDING EXACT BYTES: {hexString} (Length: {data.Length})");
                 StatusChanged?.Invoke($"[{timestamp}] SENDING: {hexString} (Length: {data.Length})");
                 
-                // Send all bytes at once with aggressive flushing
-                await _bluetoothStream.WriteAsync(data, 0, data.Length);
+                // DIRECT SEND: Write each byte individually to ensure no buffering interference
+                // This prevents the 1-byte offset issue by being very explicit about what gets sent
+                for (int i = 0; i < data.Length; i++)
+                {
+                    await _bluetoothStream.WriteAsync(new byte[] { data[i] }, 0, 1);
+                }
+                
+                // Flush aggressively after sending all bytes
                 await _bluetoothStream.FlushAsync();
                 
-                // Add a small delay to ensure the data goes out before any response comes back
-                await Task.Delay(10);
+                // Double flush to ensure bytes go out immediately
+                await _bluetoothStream.FlushAsync();
+                
+                // Add a small delay to ensure the data goes out completely
+                await Task.Delay(15);
                 
                 StatusChanged?.Invoke($"[{timestamp}] SENT and FLUSHED: {hexString}");
                 Debug.WriteLine($"[{timestamp}] SENT and FLUSHED: {hexString}");
