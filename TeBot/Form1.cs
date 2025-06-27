@@ -61,10 +61,20 @@ namespace TeBot
                 {
                     UpdateStatus($"📨 Received {data.Length} bytes from Scratch - processing...");
                     
-                    // Process data based on format
-                    if (data.Length == 80)
+                    // Support multiple data formats
+                    if (data.Length == 8)
                     {
-                        // Direct 80-byte format - split into 10 packets of 8 bytes
+                        // New 8-byte command format
+                        await ProcessScratch8ByteCommand(data);
+                    }
+                    else if (data.Length == 80 && data[0] == 0xAA && data[1] == 0x55)
+                    {
+                        // 80-byte packet with headers
+                        await ProcessScratch80ByteProtocol(data);
+                    }
+                    else if (data.Length == 80)
+                    {
+                        // Legacy 80-byte format without headers
                         await ProcessScratchCommand80Bytes(data);
                     }
                     else if (data.Length > 80 && IsJsonData(data))
@@ -74,7 +84,7 @@ namespace TeBot
                     }
                     else
                     {
-                        UpdateStatus($"❌ Invalid data format from Scratch. Expected 80 bytes or JSON. Received: {data.Length} bytes");
+                        UpdateStatus($"❌ Invalid data format from Scratch. Expected 8 or 80 bytes, or JSON. Received: {data.Length} bytes");
                         await SendResponseToScratch(new List<byte[]>(), false, "Invalid data format");
                     }
                 }
@@ -89,6 +99,76 @@ namespace TeBot
                 UpdateStatus($"❌ Error processing Scratch data: {ex.Message}");
                 await SendResponseToScratch(new List<byte[]>(), false, $"Processing error: {ex.Message}");
             }
+        }
+
+        private async Task ProcessScratch8ByteCommand(byte[] data)
+        {
+            try
+            {
+                UpdateStatus($"🔄 Processing 8-byte command from Scratch...");
+                
+                // Validate 8-byte command
+                if (data.Length != 8)
+                {
+                    throw new ArgumentException($"Expected 8 bytes, received {data.Length} bytes");
+                }
+                
+                // Log the command details
+                var cmdType = data[0];
+                var param1 = data[1];
+                var param2 = data[2];
+                var param3 = data[3];
+                
+                UpdateStatus($"📋 Command: 0x{cmdType:X2}, Params: [{param1}, {param2}, {param3}, ...]");
+                
+                // Create array with single packet
+                var packets = new byte[1][];
+                packets[0] = new byte[8];
+                Array.Copy(data, 0, packets[0], 0, 8);
+                
+                // Send to robot
+                bool success = await _bluetoothManager.SendDataArrayAsync(packets);
+                
+                if (success)
+                {
+                    // Wait for single response packet
+                    var responses = await WaitForResponsesWithTimeout(1, 1000);
+                    
+                    if (responses.Count > 0)
+                    {
+                        UpdateStatus($"✅ Robot responded with {responses[0].Length} bytes");
+                        
+                        // Send the 8-byte response directly to Scratch (no padding)
+                        await SendRawResponseToScratch(responses[0]);
+                    }
+                    else
+                    {
+                        UpdateStatus($"⚠️ No response from robot");
+                        await SendRawResponseToScratch(new byte[8]); // Send 8 zeros for no response
+                    }
+                }
+                else
+                {
+                    UpdateStatus($"❌ Failed to send command to robot");
+                    await SendRawResponseToScratch(new byte[8]); // Send 8 zeros for send failure
+                }
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"❌ Error processing 8-byte command: {ex.Message}");
+                await SendResponseToScratch(new List<byte[]>(), false, $"Processing error: {ex.Message}");
+            }
+        }
+        
+        private byte[] CreatePaddedResponse(byte[] robotResponse)
+        {
+            // Create 80-byte response by repeating the 8-byte robot response 10 times
+            var paddedResponse = new byte[80];
+            for (int i = 0; i < 10; i++)
+            {
+                Array.Copy(robotResponse, 0, paddedResponse, i * 8, Math.Min(8, robotResponse.Length));
+            }
+            return paddedResponse;
         }
 
         private async Task ProcessScratchCommand80Bytes(byte[] data)
@@ -223,6 +303,30 @@ namespace TeBot
             catch (Exception ex)
             {
                 UpdateStatus($"❌ Error sending response to Scratch: {ex.Message}");
+            }
+        }
+
+        private async Task SendRawResponseToScratch(byte[] responseData)
+        {
+            try
+            {
+                // Ensure we have exactly 8 bytes
+                byte[] rawResponse = new byte[8];
+                if (responseData != null && responseData.Length > 0)
+                {
+                    Array.Copy(responseData, 0, rawResponse, 0, Math.Min(responseData.Length, 8));
+                }
+                
+                UpdateStatus($"📤 Sending raw 8-byte response to Scratch");
+                
+                // Send the raw 8-byte response directly through WebSocket
+                await _webSocketServer.SendToAllClientsAsync(rawResponse);
+                
+                UpdateStatus($"✅ Raw 8-byte response sent to Scratch");
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"❌ Error sending raw response to Scratch: {ex.Message}");
             }
         }
 
@@ -373,12 +477,25 @@ namespace TeBot
             }
         }
 
-        private void btnStopServer_Click(object sender, EventArgs e)
+        private async void btnStopServer_Click(object sender, EventArgs e)
         {
-            _webSocketServer.Stop();
-            btnStartServer.Enabled = true;
-            btnStopServer.Enabled = false;
-            UpdateStatus("WebSocket server stopped");
+            try
+            {
+                btnStopServer.Enabled = false;
+                UpdateStatus("Stopping WebSocket server...");
+                
+                // Stop server asynchronously to prevent UI hanging
+                await _webSocketServer.StopAsync();
+                
+                btnStartServer.Enabled = true;
+                UpdateStatus("WebSocket server stopped");
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"Error stopping server: {ex.Message}");
+                btnStartServer.Enabled = true;
+                btnStopServer.Enabled = true;
+            }
         }
 
         private async void btnScanDevices_Click(object sender, EventArgs e)
@@ -1070,6 +1187,172 @@ namespace TeBot
                 btnConnect.Enabled = false;
                 
                 UpdateStatus($"Selected unpaired device: {selectedDevice.DeviceName} ({selectedDevice.DeviceAddress}) - pair first");
+            }
+        }
+
+        private async Task ProcessScratch80ByteProtocol(byte[] data)
+        {
+            try
+            {
+                // Parse 80-byte structured packet
+                // Bytes 0-1: Header (0xAA, 0x55)
+                // Bytes 2-3: Request ID
+                // Byte 4: Data length
+                // Bytes 5-6: Timestamp
+                // Byte 7: Reserved
+                // Bytes 8-71: Command data (64 bytes max)
+                // Byte 72: Checksum
+                // Bytes 73-79: Padding
+                
+                if (data[0] != 0xAA || data[1] != 0x55)
+                {
+                    UpdateStatus("❌ Invalid packet header");
+                    await SendResponseToScratch(new List<byte[]>(), false, "Invalid header");
+                    return;
+                }
+                
+                int requestId = BitConverter.ToUInt16(data, 2);
+                int dataLength = data[4];
+                int timestamp = BitConverter.ToUInt16(data, 5);
+                byte checksum = data[72];
+                
+                // Verify checksum
+                byte calculatedChecksum = 0;
+                for (int i = 0; i < 72; i++)
+                {
+                    calculatedChecksum ^= data[i];
+                }
+                
+                if (checksum != calculatedChecksum)
+                {
+                    UpdateStatus($"❌ Checksum mismatch. Expected: {calculatedChecksum:X2}, Got: {checksum:X2}");
+                    await SendResponseToScratch(new List<byte[]>(), false, "Checksum error");
+                    return;
+                }
+                
+                // Extract command data
+                byte[] commandData = new byte[dataLength];
+                Array.Copy(data, 8, commandData, 0, Math.Min(dataLength, 64));
+                
+                UpdateStatus($"✅ Valid packet: ID={requestId}, Length={dataLength}, Commands={dataLength}");
+                
+                // Process the commands and send to robot
+                await ProcessCommandsToRobot(commandData, requestId);
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"❌ Error in protocol processing: {ex.Message}");
+                await SendResponseToScratch(new List<byte[]>(), false, $"Protocol error: {ex.Message}");
+            }
+        }
+
+        private async Task ProcessCommandsToRobot(byte[] commands, int requestId)
+        {
+            try
+            {
+                // Split commands into 8-byte packets (max 8 packets from 64 bytes)
+                var packets = new List<byte[]>();
+                
+                for (int i = 0; i < commands.Length; i += 8)
+                {
+                    byte[] packet = new byte[8];
+                    int bytesToCopy = Math.Min(8, commands.Length - i);
+                    Array.Copy(commands, i, packet, 0, bytesToCopy);
+                    
+                    // Pad remaining bytes with zeros if needed
+                    for (int j = bytesToCopy; j < 8; j++)
+                    {
+                        packet[j] = 0x00;
+                    }
+                    
+                    packets.Add(packet);
+                }
+                
+                UpdateStatus($"🔄 Sending {packets.Count} packets to robot (Request ID: {requestId})...");
+                
+                // Send to robot and wait for response
+                bool success = await _bluetoothManager.SendDataArrayAsync(packets.ToArray());
+                
+                if (success)
+                {
+                    // Wait for robot response
+                    var responses = await WaitForResponsesWithTimeout(packets.Count, 3000);
+                    
+                    UpdateStatus($"✅ Robot responded: {responses.Count}/{packets.Count} packets received");
+                    
+                    // Send structured response back to Scratch
+                    await SendStructuredResponseToScratch(responses, requestId, true, "Success");
+                    
+                    // Update counters
+                    Interlocked.Increment(ref _dataPacketsSent);
+                    BeginInvoke(new Action(() =>
+                    {
+                        lblDataCount.Text = $"Scratch commands processed: {_dataPacketsSent}";
+                    }));
+                }
+                else
+                {
+                    UpdateStatus("❌ Failed to send data to robot");
+                    await SendStructuredResponseToScratch(new List<byte[]>(), requestId, false, "Robot send failed");
+                }
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"❌ Error processing commands: {ex.Message}");
+                await SendStructuredResponseToScratch(new List<byte[]>(), requestId, false, $"Command error: {ex.Message}");
+            }
+        }
+
+        private async Task SendStructuredResponseToScratch(List<byte[]> robotResponses, int requestId, bool success, string message)
+        {
+            try
+            {
+                // Create 80-byte response packet
+                byte[] responsePacket = new byte[80];
+                
+                // Header
+                responsePacket[0] = 0xBB; // Response header
+                responsePacket[1] = 0x66; // Response header
+                
+                // Request ID (echo back)
+                BitConverter.GetBytes((ushort)requestId).CopyTo(responsePacket, 2);
+                
+                // Status
+                responsePacket[4] = (byte)(success ? 0x01 : 0x00);
+                responsePacket[5] = (byte)robotResponses.Count;
+                
+                // Timestamp
+                BitConverter.GetBytes((ushort)(DateTime.Now.Ticks & 0xFFFF)).CopyTo(responsePacket, 6);
+                
+                // Robot response data (up to 64 bytes)
+                int dataOffset = 8;
+                foreach (var response in robotResponses.Take(8)) // Max 8 responses
+                {
+                    if (dataOffset + 8 <= 72) // Leave space for checksum and padding
+                    {
+                        response.CopyTo(responsePacket, dataOffset);
+                        dataOffset += 8;
+                    }
+                }
+                
+                // Checksum
+                byte checksum = 0;
+                for (int i = 0; i < 72; i++)
+                {
+                    checksum ^= responsePacket[i];
+                }
+                responsePacket[72] = checksum;
+                
+                // Padding (bytes 73-79 already initialized to 0)
+                
+                // Send response back to Scratch
+                await _webSocketServer.SendToAllClientsAsync(responsePacket);
+                
+                UpdateStatus($"📤 Sent response to Scratch: ID={requestId}, Success={success}, Data={robotResponses.Count} packets");
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"❌ Error sending structured response: {ex.Message}");
             }
         }
     }

@@ -99,21 +99,28 @@ See `HC05_BaudRate_Setup.txt` for detailed configuration instructions.
 
 ### WebSocket Integration
 - **Default Port**: 8080
-- **Protocol**: Binary data transmission
-- **Format**: 8-byte packets from Scratch extensions
+- **Protocol**: Binary data transmission (80 bytes) or JSON
+- **Format**: 80-byte packets from Scratch extensions representing 10 commands
 
 ### Data Formats
 
-#### Master Commands (TeBot → Robot)
+#### Scratch to C# (WebSocket)
 ```
-82-byte format:
-[2-byte marker: 0xAA 0x55] + [10 × 8-byte data packets]
+80-byte format:
+[10 × 8-byte command packets] - No headers, direct command data
 ```
 
-#### Slave Responses (Robot → TeBot)
+#### C# to Arduino (Bluetooth)
 ```
-82-byte format:
-[2-byte marker] + [10 × 8-byte response packets]
+Individual 8-byte packets sent sequentially:
+[cmd_type, param1, param2, param3, param4, param5, param6, param7]
+C# splits 80-byte Scratch input into 10×8-byte packets via SendDataArrayAsync()
+```
+
+#### Arduino to C# (Bluetooth)
+```
+8-byte response per command:
+[status, direction, speed, battery, distance, led_state, moving, counter]
 ```
 
 ## Architecture

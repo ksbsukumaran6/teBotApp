@@ -99,22 +99,59 @@ namespace TeBot
 
         public void Stop()
         {
+            StopAsync().Wait(TimeSpan.FromSeconds(5)); // 5 second timeout
+        }
+
+        public async Task StopAsync()
+        {
             try
             {
                 if (_server != null && _isRunning)
                 {
+                    Debug.WriteLine("Stopping WebSocket server...");
+                    
+                    // Set flag first to prevent new operations
+                    _isRunning = false;
+                    
+                    // Unsubscribe from events first
                     DataReceiver.GlobalDataReceived -= OnDataReceived;
                     DataReceiver.SessionConnected -= OnSessionConnected;
                     DataReceiver.SessionDisconnected -= OnSessionDisconnected;
-                    _server.Stop();
-                    _isRunning = false;
+                    
+                    // Clear sessions
                     _sessions.Clear();
-                    Debug.WriteLine("WebSocket server stopped");
+                    
+                    // Stop server in background task with timeout
+                    var stopTask = Task.Run(() => 
+                    {
+                        try
+                        {
+                            _server.Stop();
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"Exception during server stop: {ex.Message}");
+                        }
+                    });
+                    
+                    // Wait for stop with timeout
+                    if (await Task.WhenAny(stopTask, Task.Delay(3000)) == stopTask)
+                    {
+                        Debug.WriteLine("WebSocket server stopped gracefully");
+                    }
+                    else
+                    {
+                        Debug.WriteLine("WebSocket server stop timed out - forcing shutdown");
+                    }
+                    
+                    _server = null;
                 }
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"Error stopping WebSocket server: {ex.Message}");
+                _isRunning = false;
+                _server = null;
             }
         }
 
@@ -170,7 +207,14 @@ namespace TeBot
 
         public void Dispose()
         {
-            Stop();
+            try
+            {
+                Stop();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error during dispose: {ex.Message}");
+            }
         }
     }
 }
