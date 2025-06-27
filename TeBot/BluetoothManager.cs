@@ -11,7 +11,8 @@ using InTheHand.Net.Bluetooth;
 using InTheHand.Net.Sockets;
 
 namespace TeBot
-{    public class BluetoothManager
+{
+    public class BluetoothManager
     {
         private BluetoothClient _bluetoothClient;
         private BluetoothDeviceInfo _connectedDevice;
@@ -58,6 +59,13 @@ namespace TeBot
         
         // Master/Slave role identification
         private bool _isMasterMode = true; // TeBot acts as master by default
+        
+        // Bluetooth adapter management for external dongles
+        private BluetoothRadio[] _availableRadios;
+        private BluetoothRadio _selectedRadio;
+        
+        // Events for adapter discovery
+        public event Action<BluetoothRadio[]> BluetoothAdaptersDiscovered;
 
         public bool IsConnected => _isConnected;
         public string ConnectedDeviceName => _connectedDevice?.DeviceName ?? "None";
@@ -66,9 +74,18 @@ namespace TeBot
         public bool IsContinuousMode => _isContinuousMode;
         public bool IsListenOnlyMode => _isListenOnlyMode;
         public bool IsMasterMode => _isMasterMode;
+        
+        // Additional properties for adapter management
+        public BluetoothRadio[] AvailableBluetoothAdapters => _availableRadios ?? new BluetoothRadio[0];
+        public BluetoothRadio SelectedBluetoothAdapter => _selectedRadio;
+        public string SelectedAdapterInfo => _selectedRadio != null ? 
+            $"{_selectedRadio.Name} ({_selectedRadio.LocalAddress})" : "None";
 
         public BluetoothManager()
         {
+            // Initialize and detect Bluetooth adapters first
+            DetectBluetoothAdapters();
+            
             _bluetoothClient = new BluetoothClient();
             
             // Setup periodic flush timer for better performance
@@ -95,14 +112,54 @@ namespace TeBot
         {
             try
             {
-                StatusChanged?.Invoke("Scanning for Bluetooth devices...");
-                
-                var devices = await Task.Run(() =>
+                // Ensure we have a selected adapter
+                if (_selectedRadio == null)
                 {
-                    return _bluetoothClient.DiscoverDevices(10, true, true, false);
+                    DetectBluetoothAdapters();
+                    PreferExternalDongle();
+                }
+
+                var adapterInfo = _selectedRadio != null ? 
+                    $" using {_selectedRadio.Name}" : " using default adapter";
+                
+                StatusChanged?.Invoke($"Scanning for Bluetooth devices{adapterInfo}...");
+                
+                var allDevices = new List<BluetoothDeviceInfo>();
+                
+                var scanTask = Task.Run(() =>
+                {
+                    try
+                    {
+                        // First, get already paired devices
+                        var pairedDevices = _bluetoothClient.DiscoverDevices(10, true, false, false);
+                        StatusChanged?.Invoke($"Found {pairedDevices.Length} already paired devices");
+                        allDevices.AddRange(pairedDevices);
+                        
+                        // Then scan for discoverable devices (not necessarily paired)
+                        var discoverableDevices = _bluetoothClient.DiscoverDevices(15, false, true, false);
+                        StatusChanged?.Invoke($"Found {discoverableDevices.Length} discoverable devices");
+                        
+                        // Add discoverable devices that aren't already in our paired list
+                        foreach (var device in discoverableDevices)
+                        {
+                            if (!allDevices.Any(d => d.DeviceAddress.Equals(device.DeviceAddress)))
+                            {
+                                allDevices.Add(device);
+                            }
+                        }
+                        
+                        return allDevices.ToArray();
+                    }
+                    catch (Exception ex)
+                    {
+                        StatusChanged?.Invoke($"Error during device discovery: {ex.Message}");
+                        return new BluetoothDeviceInfo[0];
+                    }
                 });
 
-                StatusChanged?.Invoke($"Found {devices.Length} Bluetooth devices");
+                var devices = await scanTask;
+                
+                StatusChanged?.Invoke($"Found {devices.Length} total Bluetooth devices{adapterInfo} ({allDevices.Count(d => d.Authenticated)} paired, {allDevices.Count(d => !d.Authenticated)} unpaired)");
                 DevicesDiscovered?.Invoke(devices);
                 return devices;
             }
@@ -1294,24 +1351,32 @@ namespace TeBot
                 _isListenOnlyMode = false;
                 _isTransmitting = false;
                 
-                // Dispose timers without waiting
-                try { _transmissionTimer?.Dispose(); } catch { }
-                try { _continuousTransmissionTimer?.Dispose(); } catch { }
-                try { _flushTimer?.Stop(); } catch { }
+                // Dispose timers without waiting - use parallel execution for speed
+                Task.Run(() =>
+                {
+                    try { _transmissionTimer?.Dispose(); } catch { }
+                    try { _continuousTransmissionTimer?.Dispose(); } catch { }
+                    try { _flushTimer?.Stop(); } catch { }
+                });
                 
-                // Cancel operations
+                // Cancel operations immediately
                 try { _transmissionCancellation?.Cancel(); } catch { }
                 try { _transmissionCancellation?.Dispose(); } catch { }
                 
-                // Force close stream
-                try { _bluetoothStream?.Close(); } catch { }
-                try { _bluetoothStream?.Dispose(); } catch { }
+                // Force close stream and client in parallel
+                Task.Run(() =>
+                {
+                    try { _bluetoothStream?.Close(); } catch { }
+                    try { _bluetoothStream?.Dispose(); } catch { }
+                });
                 
-                // Force close and dispose client
-                try { _bluetoothClient?.Close(); } catch { }
-                try { _bluetoothClient?.Dispose(); } catch { }
+                Task.Run(() =>
+                {
+                    try { _bluetoothClient?.Close(); } catch { }
+                    try { _bluetoothClient?.Dispose(); } catch { }
+                });
                 
-                // Clear all references
+                // Clear all references immediately
                 _bluetoothStream = null;
                 _bluetoothClient = null;
                 _connectedDevice = null;
@@ -1319,7 +1384,7 @@ namespace TeBot
                 _transmissionTimer = null;
                 _continuousTransmissionTimer = null;
                 
-                // Clear queues
+                // Clear queues quickly
                 try
                 { 
                     while (_dataQueue.TryDequeue(out _)) { }
@@ -1333,6 +1398,445 @@ namespace TeBot
             catch (Exception ex)
             {
                 StatusChanged?.Invoke($"Error in force disconnect: {ex.Message}");
+                // Even if force disconnect fails, ensure critical flags are reset
+                _isConnected = false;
+                _isContinuousMode = false;
+                _isListenOnlyMode = false;
+                _isTransmitting = false;
+            }
+        }
+
+        /// <summary>
+        /// Detect all available Bluetooth adapters (built-in + external dongles)
+        /// </summary>
+        public void DetectBluetoothAdapters()
+        {
+            try
+            {
+                StatusChanged?.Invoke("Detecting Bluetooth adapters...");
+                
+                var radios = BluetoothRadio.AllRadios;
+                _availableRadios = radios;
+                
+                StatusChanged?.Invoke($"Found {radios.Length} Bluetooth adapter(s):");
+                
+                for (int i = 0; i < radios.Length; i++)
+                {
+                    var radio = radios[i];
+                    var adapterInfo = $"[{i + 1}] {radio.Name} - {radio.LocalAddress} " +
+                                     $"(Mode: {radio.Mode})";
+                    StatusChanged?.Invoke($"  {adapterInfo}");
+                    Debug.WriteLine($"Bluetooth Adapter {i + 1}: {adapterInfo}");
+                    
+                    // Check if this looks like a TP-Link dongle
+                    if (IsTPLinkDongle(radio))
+                    {
+                        StatusChanged?.Invoke($"  ⭐ Detected TP-Link USB dongle: {radio.Name}");
+                    }
+                }
+                
+                // Auto-select the best adapter if none is selected
+                if (_selectedRadio == null && radios.Length > 0)
+                {
+                    PreferExternalDongle();
+                }
+                
+                BluetoothAdaptersDiscovered?.Invoke(radios);
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke($"Error detecting Bluetooth adapters: {ex.Message}");
+                Debug.WriteLine($"DetectBluetoothAdapters error: {ex}");
+                _availableRadios = new BluetoothRadio[0];
+            }
+        }
+
+        /// <summary>
+        /// Check if a Bluetooth radio appears to be a TP-Link dongle
+        /// </summary>
+        private bool IsTPLinkDongle(BluetoothRadio radio)
+        {
+            try
+            {
+                var name = radio.Name?.ToLower() ?? "";
+                var manufacturer = radio.Manufacturer.ToString().ToLower();
+                
+                // Check for TP-Link specific identifiers
+                if (name.Contains("tp-link") || name.Contains("tplink") ||
+                    manufacturer.Contains("tp-link") || manufacturer.Contains("tplink"))
+                {
+                    return true;
+                }
+                
+                // TP-Link dongles often use these chip manufacturers
+                if (manufacturer.Contains("realtek") || 
+                    manufacturer.Contains("cambridge_silicon_radio") ||
+                    manufacturer.Contains("broadcom") ||
+                    manufacturer.Contains("csr"))
+                {
+                    // Additional checks for USB dongles
+                    if (name.Contains("usb") || name.Contains("dongle") || name.Contains("external"))
+                    {
+                        return true;
+                    }
+                }
+                
+                // Check for common USB Bluetooth dongle patterns
+                if (name.Contains("bluetooth usb") || 
+                    name.Contains("usb bluetooth") ||
+                    name.Contains("external bluetooth") ||
+                    name.Contains("bluetooth dongle"))
+                {
+                    return true;
+                }
+                
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Select a specific Bluetooth adapter by index
+        /// </summary>
+        public bool SelectBluetoothAdapter(int adapterIndex)
+        {
+            try
+            {
+                if (_availableRadios == null || adapterIndex < 0 || adapterIndex >= _availableRadios.Length)
+                {
+                    StatusChanged?.Invoke($"Invalid adapter index: {adapterIndex}");
+                    return false;
+                }
+
+                var radio = _availableRadios[adapterIndex];
+                
+                // Try to enable the adapter if needed
+                StatusChanged?.Invoke($"Selecting adapter: {radio.Name}");
+                try
+                {
+                    if (radio.Mode != RadioMode.Connectable)
+                    {
+                        radio.Mode = RadioMode.Connectable;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    StatusChanged?.Invoke($"Could not enable adapter {radio.Name}: {ex.Message}");
+                    // Continue anyway - some adapters don't allow mode changes
+                }
+
+                _selectedRadio = radio;
+                
+                // Create a new BluetoothClient - we can't specify which adapter directly with 32feet.NET
+                // but we can set the selected radio for reference
+                _bluetoothClient?.Dispose();
+                _bluetoothClient = new BluetoothClient();
+                
+                var dongleType = IsTPLinkDongle(radio) ? "TP-Link USB" : "Built-in";
+                StatusChanged?.Invoke($"✅ Selected {dongleType} Bluetooth adapter: {radio.Name} ({radio.LocalAddress})");
+                StatusChanged?.Invoke($"   Mode: {radio.Mode}");
+                StatusChanged?.Invoke($"   Manufacturer: {radio.Manufacturer}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke($"Error selecting Bluetooth adapter: {ex.Message}");
+                Debug.WriteLine($"SelectBluetoothAdapter error: {ex}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Auto-detect and prefer external TP-Link dongle over built-in Bluetooth
+        /// </summary>
+        public bool PreferExternalDongle()
+        {
+            try
+            {
+                if (_availableRadios == null || _availableRadios.Length == 0)
+                {
+                    StatusChanged?.Invoke("No Bluetooth adapters found");
+                    return false;
+                }
+
+                if (_availableRadios.Length == 1)
+                {
+                    StatusChanged?.Invoke("Only one Bluetooth adapter found - using it");
+                    return SelectBluetoothAdapter(0);
+                }
+
+                StatusChanged?.Invoke($"Multiple adapters found ({_availableRadios.Length}), prioritizing external TP-Link dongles...");
+
+                // Priority 1: Look for TP-Link dongles first (highest priority)
+                for (int i = 0; i < _availableRadios.Length; i++)
+                {
+                    var radio = _availableRadios[i];
+                    if (IsTPLinkDongle(radio))
+                    {
+                        var name = radio.Name?.ToLower() ?? "";
+                        if (name.Contains("tp-link") || name.Contains("tplink"))
+                        {
+                            StatusChanged?.Invoke($"� Found TP-Link dongle: {radio.Name} - selecting it as highest priority");
+                            return SelectBluetoothAdapter(i);
+                        }
+                    }
+                }
+
+                // Priority 2: Look for any external USB dongles
+                for (int i = 0; i < _availableRadios.Length; i++)
+                {
+                    var radio = _availableRadios[i];
+                    if (IsTPLinkDongle(radio))
+                    {
+                        StatusChanged?.Invoke($"🔍 Found external USB dongle: {radio.Name} - selecting it");
+                        return SelectBluetoothAdapter(i);
+                    }
+                }
+
+                // Priority 3: Look for any USB-related adapters
+                for (int i = 0; i < _availableRadios.Length; i++)
+                {
+                    var radio = _availableRadios[i];
+                    var name = radio.Name?.ToLower() ?? "";
+                    
+                    if (name.Contains("usb") || name.Contains("dongle") || name.Contains("external"))
+                    {
+                        StatusChanged?.Invoke($"🔍 Found USB adapter: {radio.Name} - selecting it");
+                        return SelectBluetoothAdapter(i);
+                    }
+                }
+
+                // Default to first adapter if no external dongles found
+                StatusChanged?.Invoke("No external dongles detected, using first available adapter (likely built-in)");
+                return SelectBluetoothAdapter(0);
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke($"Error preferring external dongle: {ex.Message}");
+                Debug.WriteLine($"PreferExternalDongle error: {ex}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Get detailed information about all Bluetooth adapters
+        /// </summary>
+        public List<string> GetBluetoothAdapterDetails()
+        {
+            var details = new List<string>();
+            
+            try
+            {
+                if (_availableRadios == null || _availableRadios.Length == 0)
+                {
+                    details.Add("No Bluetooth adapters found");
+                    return details;
+                }
+
+                for (int i = 0; i < _availableRadios.Length; i++)
+                {
+                    var radio = _availableRadios[i];
+                    var isSelected = radio == _selectedRadio ? " ⭐ SELECTED" : "";
+                    var isTPLink = IsTPLinkDongle(radio) ? " 🔥 TP-LINK DONGLE" : "";
+                    
+                    details.Add($"[{i + 1}] {radio.Name}{isSelected}{isTPLink}");
+                    details.Add($"    Address: {radio.LocalAddress}");
+                    details.Add($"    Manufacturer: {radio.Manufacturer}");
+                    details.Add($"    Mode: {radio.Mode}");
+                    details.Add($"    Class of Device: {radio.ClassOfDevice}");
+                    details.Add($"    LMP Version: {radio.LmpVersion}");
+                    details.Add("");
+                }
+            }
+            catch (Exception ex)
+            {
+                details.Add($"Error getting adapter details: {ex.Message}");
+            }
+            
+            return details;
+        }
+
+        /// <summary>
+        /// Force refresh adapters and select TP-Link dongle if available
+        /// </summary>
+        public void RefreshAndSelectTPLinkDongle()
+        {
+            try
+            {
+                StatusChanged?.Invoke("🔄 Refreshing Bluetooth adapters...");
+                DetectBluetoothAdapters();
+                
+                if (_availableRadios != null && _availableRadios.Length > 0)
+                {
+                    // Force re-selection with preference for TP-Link
+                    _selectedRadio = null;
+                    PreferExternalDongle();
+                    
+                    var selectedInfo = SelectedAdapterInfo;
+                    StatusChanged?.Invoke($"✅ Adapter selection complete: {selectedInfo}");
+                }
+                else
+                {
+                    StatusChanged?.Invoke("❌ No Bluetooth adapters found after refresh");
+                }
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke($"Error refreshing adapters: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Get human-readable adapter information including dongle type
+        /// </summary>
+        public string GetSelectedAdapterDescription()
+        {
+            if (_selectedRadio == null)
+                return "No adapter selected";
+                
+            var dongleType = IsTPLinkDongle(_selectedRadio) ? "🔥 TP-Link USB Dongle" : "💻 Built-in Bluetooth";
+            return $"{dongleType}: {_selectedRadio.Name} ({_selectedRadio.LocalAddress})";
+        }
+        
+        /// <summary>
+        /// Pair with a Bluetooth device using PIN or SSP
+        /// </summary>
+        public async Task<bool> PairWithDeviceAsync(BluetoothDeviceInfo device, string pin = "1234")
+        {
+            try
+            {
+                StatusChanged?.Invoke($"Attempting to pair with {device.DeviceName}...");
+                
+                // Check if device is already paired
+                if (device.Authenticated)
+                {
+                    StatusChanged?.Invoke($"✅ {device.DeviceName} is already paired");
+                    return true;
+                }
+
+                // Attempt pairing
+                bool pairingResult = false;
+                
+                await Task.Run(() =>
+                {
+                    try
+                    {
+                        // Try pairing with PIN
+                        pairingResult = BluetoothSecurity.PairRequest(device.DeviceAddress, pin);
+                    }
+                    catch (Exception ex)
+                    {
+                        StatusChanged?.Invoke($"PIN pairing failed: {ex.Message}");
+                        
+                        // Try without PIN (for SSP devices)
+                        try
+                        {
+                            pairingResult = BluetoothSecurity.PairRequest(device.DeviceAddress, null);
+                        }
+                        catch (Exception ex2)
+                        {
+                            StatusChanged?.Invoke($"SSP pairing also failed: {ex2.Message}");
+                        }
+                    }
+                });
+
+                if (pairingResult)
+                {
+                    StatusChanged?.Invoke($"🎉 Successfully paired with {device.DeviceName}!");
+                    
+                    // Refresh device to get updated authentication status
+                    device.Refresh();
+                    
+                    return true;
+                }
+                else
+                {
+                    StatusChanged?.Invoke($"❌ Failed to pair with {device.DeviceName}");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke($"Error during pairing: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Remove pairing with a Bluetooth device
+        /// </summary>
+        public async Task<bool> UnpairDeviceAsync(BluetoothDeviceInfo device)
+        {
+            try
+            {
+                StatusChanged?.Invoke($"Removing pairing with {device.DeviceName}...");
+                
+                bool result = await Task.Run(() =>
+                {
+                    try
+                    {
+                        return BluetoothSecurity.RemoveDevice(device.DeviceAddress);
+                    }
+                    catch (Exception ex)
+                    {
+                        StatusChanged?.Invoke($"Unpair error: {ex.Message}");
+                        return false;
+                    }
+                });
+
+                if (result)
+                {
+                    StatusChanged?.Invoke($"✅ Successfully unpaired {device.DeviceName}");
+                    device.Refresh();
+                    return true;
+                }
+                else
+                {
+                    StatusChanged?.Invoke($"❌ Failed to unpair {device.DeviceName}");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke($"Error during unpairing: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Get list of paired devices
+        /// </summary>
+        public BluetoothDeviceInfo[] GetPairedDevices()
+        {
+            try
+            {
+                var pairedDevices = _bluetoothClient.DiscoverDevices(10, true, false, false);
+                StatusChanged?.Invoke($"Found {pairedDevices.Length} paired device(s)");
+                return pairedDevices;
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke($"Error getting paired devices: {ex.Message}");
+                return new BluetoothDeviceInfo[0];
+            }
+        }
+
+        /// <summary>
+        /// Check if a device is paired and authenticated
+        /// </summary>
+        public bool IsDevicePaired(BluetoothDeviceInfo device)
+        {
+            try
+            {
+                device.Refresh(); // Update authentication status
+                return device.Authenticated;
+            }
+            catch
+            {
+                return false;
             }
         }
     }

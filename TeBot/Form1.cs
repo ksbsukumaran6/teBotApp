@@ -12,94 +12,17 @@ using InTheHand.Net.Sockets;
 
 namespace TeBot
 {    public partial class Form1 : Form
-    {        private WebSocketDataServer _webSocketServer;
+    {
+        private WebSocketDataServer _webSocketServer;
         private BluetoothManager _bluetoothManager;
         private int _dataPacketsSent = 0;
-        private Button btnTestMultipleArrays;
-        private Button btnStartContinuous;
-        private Button btnStopContinuous;
-        private Button btnStartListen;
-        private Button btnStopListen;
         private int _continuousResponseCount = 0;
+
         public Form1()
         {
             InitializeComponent();
-            CreateTestButton(); // Create button first
-            InitializeComponents(); // Then initialize other components
-        }        private void CreateTestButton()
-        {
-            try
-            {
-                // Create the test button programmatically
-                btnTestMultipleArrays = new Button
-                {
-                    Name = "btnTestMultipleArrays",
-                    Text = "Test Multiple Arrays",
-                    Size = new Size(140, 30),
-                    Location = new Point(130, 110),
-                    Enabled = false,
-                    UseVisualStyleBackColor = true
-                };
-                
-                btnTestMultipleArrays.Click += btnTestMultipleArrays_Click;
-                this.Controls.Add(btnTestMultipleArrays);
-
-                // Create continuous transmission buttons
-                btnStartContinuous = new Button
-                {
-                    Name = "btnStartContinuous",
-                    Text = "Start Continuous",
-                    Size = new Size(120, 30),
-                    Location = new Point(280, 110),
-                    Enabled = false,
-                    UseVisualStyleBackColor = true
-                };
-                
-                btnStartContinuous.Click += btnStartContinuous_Click;
-                this.Controls.Add(btnStartContinuous);                btnStopContinuous = new Button
-                {
-                    Name = "btnStopContinuous",
-                    Text = "Stop Continuous",
-                    Size = new Size(120, 30),
-                    Location = new Point(410, 110),
-                    Enabled = false,
-                    UseVisualStyleBackColor = true
-                };
-                
-                btnStopContinuous.Click += btnStopContinuous_Click;
-                this.Controls.Add(btnStopContinuous);                // Create listen-only mode buttons
-                btnStartListen = new Button
-                {
-                    Name = "btnStartListen",
-                    Text = "Start Listen Only",
-                    Size = new Size(120, 30),
-                    Location = new Point(540, 110),
-                    Enabled = false,
-                    UseVisualStyleBackColor = true
-                };
-                
-                btnStartListen.Click += btnStartListen_Click;
-                this.Controls.Add(btnStartListen);
-
-                btnStopListen = new Button
-                {
-                    Name = "btnStopListen",
-                    Text = "Stop Listen",
-                    Size = new Size(120, 30),
-                    Location = new Point(670, 110),
-                    Enabled = false,
-                    UseVisualStyleBackColor = true
-                };
-                
-                btnStopListen.Click += btnStopListen_Click;
-                this.Controls.Add(btnStopListen);
-            }
-            catch (Exception ex)
-            {
-                // Don't use UpdateStatus here as the text box might not be ready yet
-                System.Diagnostics.Debug.WriteLine($"Error creating test buttons: {ex.Message}");
-            }
-        }private void InitializeComponents()
+            InitializeComponents();
+        }        private void InitializeComponents()
         {
             // Initialize WebSocket server
             _webSocketServer = new WebSocketDataServer();
@@ -110,18 +33,16 @@ namespace TeBot
             _bluetoothManager.QueueStatus += OnQueueStatusChanged;
             _bluetoothManager.TransmissionStatus += OnTransmissionStatusChanged;
             _bluetoothManager.ContinuousResponseReceived += OnContinuousResponseReceived;
+            _bluetoothManager.BluetoothAdaptersDiscovered += OnBluetoothAdaptersDiscovered;
 
+            // Initialize adapter UI
+            LoadBluetoothAdapters();
+            
             UpdateStatus("Application started. Click 'Start Server' to begin receiving WebSocket data.");
             
-            // Verify button was created
-            if (btnTestMultipleArrays != null)
-            {
-                UpdateStatus("Test button ready for multiple array transmission.");
-            }
-            else
-            {
-                UpdateStatus("Warning: Test button not available.");
-            }
+            // Show initial adapter selection
+            UpdateAdapterSelectionUI();
+        
         }
 
         private void OnQueueStatusChanged(int queueCount)
@@ -198,43 +119,38 @@ namespace TeBot
                 }
 
                 // Connection buttons
-                btnConnect.Enabled = !isConnected && cmbDevices.SelectedItem != null;
+                var selectedItem = cmbDevices.SelectedItem as BluetoothDeviceItem;
+                var hasSelectedDevice = selectedItem?.Device != null;
+                var isPairedDevice = selectedItem?.Device?.Authenticated == true;
+                
+                btnConnect.Enabled = !isConnected && hasSelectedDevice && isPairedDevice;
                 btnDisconnect.Enabled = isConnected;
                 
                 // Test button
-                if (btnTestMultipleArrays != null)
-                {
-                    btnTestMultipleArrays.Enabled = isConnected && !_bluetoothManager.IsContinuousMode && !_bluetoothManager.IsListenOnlyMode;
-                }
+                btnTestMultipleArrays.Enabled = isConnected && !_bluetoothManager.IsContinuousMode && !_bluetoothManager.IsListenOnlyMode;
 
                 // Continuous mode buttons
-                if (btnStartContinuous != null && btnStopContinuous != null)
+                if (isConnected)
                 {
-                    if (isConnected)
-                    {
-                        btnStartContinuous.Enabled = !_bluetoothManager.IsContinuousMode && !_bluetoothManager.IsListenOnlyMode;
-                        btnStopContinuous.Enabled = _bluetoothManager.IsContinuousMode;
-                    }
-                    else
-                    {
-                        btnStartContinuous.Enabled = false;
-                        btnStopContinuous.Enabled = false;
-                    }
+                    btnStartContinuous.Enabled = !_bluetoothManager.IsContinuousMode && !_bluetoothManager.IsListenOnlyMode;
+                    btnStopContinuous.Enabled = _bluetoothManager.IsContinuousMode;
+                }
+                else
+                {
+                    btnStartContinuous.Enabled = false;
+                    btnStopContinuous.Enabled = false;
                 }
 
                 // Listen-only mode buttons
-                if (btnStartListen != null && btnStopListen != null)
+                if (isConnected)
                 {
-                    if (isConnected)
-                    {
-                        btnStartListen.Enabled = !_bluetoothManager.IsListenOnlyMode && !_bluetoothManager.IsContinuousMode;
-                        btnStopListen.Enabled = _bluetoothManager.IsListenOnlyMode;
-                    }
-                    else
-                    {
-                        btnStartListen.Enabled = false;
-                        btnStopListen.Enabled = false;
-                    }
+                    btnStartListen.Enabled = !_bluetoothManager.IsListenOnlyMode && !_bluetoothManager.IsContinuousMode;
+                    btnStopListen.Enabled = _bluetoothManager.IsListenOnlyMode;
+                }
+                else
+                {
+                    btnStartListen.Enabled = false;
+                    btnStopListen.Enabled = false;
                 }
             }
             catch (Exception ex)
@@ -250,18 +166,45 @@ namespace TeBot
                 cmbDevices.Items.Clear();
                 foreach (var device in devices)
                 {
-                    cmbDevices.Items.Add(new DeviceItem { Device = device });
+                    cmbDevices.Items.Add(new BluetoothDeviceItem { Device = device });
                 }
                 
                 if (devices.Length > 0)
                 {
-                    btnConnect.Enabled = true;
-                    UpdateStatus($"Found {devices.Length} devices. Select one to connect.");
+                    UpdateStatus($"Found {devices.Length} Bluetooth devices. Select one to pair/connect.");
+                    
+                    // Show breakdown of paired vs unpaired
+                    var pairedCount = devices.Count(d => d.Authenticated);
+                    var unpairedCount = devices.Length - pairedCount;
+                    
+                    if (pairedCount > 0 && unpairedCount > 0)
+                    {
+                        UpdateStatus($"  📱 {pairedCount} already paired, {unpairedCount} available for pairing");
+                    }
+                    else if (pairedCount > 0)
+                    {
+                        UpdateStatus($"  ✅ All {pairedCount} devices are already paired");
+                    }
+                    else
+                    {
+                        UpdateStatus($"  🔗 All {unpairedCount} devices need pairing before connection");
+                    }
+                    
+                    // Auto-select first device if available
+                    if (cmbDevices.Items.Count > 0)
+                    {
+                        cmbDevices.SelectedIndex = 0;
+                        UpdateStatus($"Auto-selected first device: {cmbDevices.Items[0]}");
+                    }
                 }
                 else
                 {
-                    UpdateStatus("No COM ports found. Make sure Bluetooth devices are paired and try again.");
+                    UpdateStatus("❌ No Bluetooth devices found. Make sure devices are discoverable and try scanning again.");
+                    UpdateStatus("💡 Tip: Put your robot/device in pairing/discoverable mode and scan again.");
                 }
+                
+                // Update button states after device list changes
+                UpdateDeviceSelectionUI();
             }));
         }
 
@@ -313,39 +256,45 @@ namespace TeBot
             }
         }        private async void btnConnect_Click(object sender, EventArgs e)
         {
-            if (cmbDevices.SelectedItem is DeviceItem selectedItem)
+            var selectedItem = cmbDevices.SelectedItem as BluetoothDeviceItem;
+            var selectedDevice = selectedItem?.Device;
+            
+            if (selectedDevice == null)
             {
-                try
+                UpdateStatus("❌ Please select a device to connect to.");
+                return;
+            }
+            
+            try
+            {
+                // Disable buttons during connection attempt
+                btnConnect.Enabled = false;
+                SetTestButtonEnabled(false);
+                
+                bool success = await _bluetoothManager.ConnectToDeviceAsync(selectedDevice);
+                if (success)
                 {
-                    // Disable buttons during connection attempt
+                    // Connection successful - enable disconnect and test buttons
                     btnConnect.Enabled = false;
-                    SetTestButtonEnabled(false);
-                    
-                    bool success = await _bluetoothManager.ConnectToDeviceAsync(selectedItem.Device);
-                    if (success)
-                    {
-                        // Connection successful - enable disconnect and test buttons
-                        btnConnect.Enabled = false;
-                        btnDisconnect.Enabled = true;
-                        SetTestButtonEnabled(true);
-                        UpdateStatus("Connected! You can now test multiple array transmission.");
-                    }
-                    else
-                    {
-                        // Connection failed - re-enable connect button
-                        btnConnect.Enabled = true;
-                        btnDisconnect.Enabled = false;
-                        SetTestButtonEnabled(false);
-                    }
+                    btnDisconnect.Enabled = true;
+                    SetTestButtonEnabled(true);
+                    UpdateStatus("Connected! You can now test multiple array transmission.");
                 }
-                catch (Exception ex)
+                else
                 {
-                    UpdateStatus($"Error connecting to device: {ex.Message}");
-                    // Error occurred - re-enable connect button
+                    // Connection failed - re-enable connect button
                     btnConnect.Enabled = true;
                     btnDisconnect.Enabled = false;
                     SetTestButtonEnabled(false);
                 }
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"Error connecting to device: {ex.Message}");
+                // Error occurred - re-enable connect button
+                btnConnect.Enabled = true;
+                btnDisconnect.Enabled = false;
+                SetTestButtonEnabled(false);
             }
         }        private void SetTestButtonEnabled(bool enabled)
         {
@@ -359,22 +308,59 @@ namespace TeBot
                 btnDisconnect.Enabled = false;
                 UpdateButtonStates(false);
                 
-                await _bluetoothManager.DisconnectAsync();
+                UpdateStatus("Disconnecting... (timeout in 8 seconds)");
                 
-                // Button states will be updated by OnBluetoothStatusChanged when "Disconnected" status is received
-                UpdateStatus("Disconnection completed.");
+                // Use timeout wrapper to prevent hanging
+                var disconnectTask = _bluetoothManager.DisconnectAsync();
+                var timeoutTask = Task.Delay(8000); // 8 second timeout
+                
+                var completedTask = await Task.WhenAny(disconnectTask, timeoutTask);
+                
+                if (completedTask == timeoutTask)
+                {
+                    // Timeout - force disconnect
+                    UpdateStatus("Disconnect timeout - forcing disconnect...");
+                    _bluetoothManager.ForceDisconnect();
+                    UpdateStatus("Force disconnect completed.");
+                }
+                else if (disconnectTask.IsFaulted)
+                {
+                    // Error in disconnect - force disconnect
+                    UpdateStatus($"Disconnect error: {disconnectTask.Exception?.GetBaseException()?.Message}");
+                    UpdateStatus("Using force disconnect...");
+                    _bluetoothManager.ForceDisconnect();
+                    UpdateStatus("Force disconnect completed.");
+                }
+                else
+                {
+                    // Normal completion
+                    UpdateStatus("Disconnection completed normally.");
+                }
+                
+                // Always ensure buttons are in correct state
+                UpdateButtonStates(false);
             }
             catch (Exception ex)
             {
                 UpdateStatus($"Error during disconnection: {ex.Message}");
+                // Final fallback - force disconnect
+                try
+                {
+                    _bluetoothManager.ForceDisconnect();
+                    UpdateStatus("Force disconnect completed after error.");
+                }
+                catch (Exception forceEx)
+                {
+                    UpdateStatus($"Force disconnect also failed: {forceEx.Message}");
+                }
                 // Ensure buttons are in correct state even if error occurred
                 UpdateButtonStates(false);
             }
-        }private void cmbDevices_SelectedIndexChanged(object sender, EventArgs e)
+        }        private void cmbDevices_SelectedIndexChanged(object sender, EventArgs e)
         {
-            // Only enable connect if device is selected AND not currently connected
-            btnConnect.Enabled = cmbDevices.SelectedItem != null && !_bluetoothManager.IsConnected;
-        }        private async void btnTestMultipleArrays_Click(object sender, EventArgs e)
+            UpdateDeviceSelectionUI();
+            UpdateButtonStates(_bluetoothManager?.IsConnected ?? false);
+        }private async void btnTestMultipleArrays_Click(object sender, EventArgs e)
         {
             if (!_bluetoothManager.IsConnected)
             {
@@ -491,16 +477,21 @@ namespace TeBot
 
         private void Form1_FormClosing(object sender, FormClosingEventArgs e)
         {
-            _webSocketServer?.Dispose();
-            _bluetoothManager?.Dispose();
-        }
-
-        private class DeviceItem
-        {            public BluetoothDeviceInfo Device { get; set; }
-            
-            public override string ToString()
+            try
             {
-                return $"{Device.DeviceName} ({Device.DeviceAddress})";
+                // Use force disconnect to avoid hanging during app exit
+                if (_bluetoothManager?.IsConnected == true)
+                {
+                    _bluetoothManager.ForceDisconnect();
+                }
+                
+                _webSocketServer?.Dispose();
+                _bluetoothManager?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                // Don't prevent closing even if cleanup fails
+                System.Diagnostics.Debug.WriteLine($"Error during form closing: {ex.Message}");
             }
         }
 
@@ -621,6 +612,326 @@ namespace TeBot
             {
                 UpdateStatus($"Error stopping listen-only mode: {ex.Message}");
                 UpdateButtonStates(true); // Ensure buttons are in correct state
+            }
+        }
+
+        // Bluetooth Adapter Management Event Handlers
+        private void btnRefreshAdapters_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                UpdateStatus("🔄 Refreshing Bluetooth adapters...");
+                RefreshBluetoothAdapters();
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"Error refreshing adapters: {ex.Message}");
+            }
+        }
+
+        private void cmbBluetoothAdapters_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            try
+            {
+                if (cmbBluetoothAdapters.SelectedIndex >= 0)
+                {
+                    var success = _bluetoothManager.SelectBluetoothAdapter(cmbBluetoothAdapters.SelectedIndex);
+                    if (success)
+                    {
+                        UpdateAdapterSelectionUI();
+                        UpdateStatus($"✅ Bluetooth adapter selected: {cmbBluetoothAdapters.SelectedItem}");
+                    }
+                    else
+                    {
+                        UpdateStatus("❌ Failed to select Bluetooth adapter");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"Error selecting adapter: {ex.Message}");
+            }
+        }
+
+        private void OnBluetoothAdaptersDiscovered(InTheHand.Net.Bluetooth.BluetoothRadio[] adapters)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action<InTheHand.Net.Bluetooth.BluetoothRadio[]>(OnBluetoothAdaptersDiscovered), adapters);
+                return;
+            }
+
+            try
+            {
+                cmbBluetoothAdapters.Items.Clear();
+                
+                for (int i = 0; i < adapters.Length; i++)
+                {
+                    var adapter = adapters[i];
+                    var isTPLink = adapter.Name?.ToLower().Contains("tp-link") == true ||
+                                   adapter.Name?.ToLower().Contains("usb") == true ||
+                                   adapter.Name?.ToLower().Contains("dongle") == true;
+                    
+                    var displayName = $"[{i + 1}] {adapter.Name}";
+                    if (isTPLink)
+                    {
+                        displayName += " 🔥"; // Fire emoji for TP-Link/USB dongles
+                    }
+                    
+                    cmbBluetoothAdapters.Items.Add(displayName);
+                }
+
+                // Auto-select the currently selected adapter
+                var selectedAdapter = _bluetoothManager.SelectedBluetoothAdapter;
+                if (selectedAdapter != null)
+                {
+                    for (int i = 0; i < adapters.Length; i++)
+                    {
+                        if (adapters[i].LocalAddress == selectedAdapter.LocalAddress)
+                        {
+                            cmbBluetoothAdapters.SelectedIndex = i;
+                            break;
+                        }
+                    }
+                }
+
+                UpdateAdapterSelectionUI();
+                UpdateStatus($"Found {adapters.Length} Bluetooth adapter(s)");
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"Error updating adapter list: {ex.Message}");
+            }
+        }
+
+        private void RefreshBluetoothAdapters()
+        {
+            try
+            {
+                _bluetoothManager.RefreshAndSelectTPLinkDongle();
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"Error refreshing adapters: {ex.Message}");
+            }
+        }
+
+        private void UpdateAdapterSelectionUI()
+        {
+            try
+            {
+                if (InvokeRequired)
+                {
+                    Invoke(new Action(UpdateAdapterSelectionUI));
+                    return;
+                }
+
+                var selectedInfo = _bluetoothManager.GetSelectedAdapterDescription();
+                lblSelectedAdapter.Text = selectedInfo;
+                
+                // Update UI based on adapter type
+                var isTPLinkSelected = selectedInfo.Contains("🔥 TP-Link") || selectedInfo.Contains("USB Dongle");
+                if (isTPLinkSelected)
+                {
+                    lblSelectedAdapter.ForeColor = Color.DarkGreen;
+                    lblSelectedAdapter.Font = new Font(lblSelectedAdapter.Font, FontStyle.Bold);
+                }
+                else
+                {
+                    lblSelectedAdapter.ForeColor = Color.DarkBlue;
+                    lblSelectedAdapter.Font = new Font(lblSelectedAdapter.Font, FontStyle.Regular);
+                }
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"Error updating adapter UI: {ex.Message}");
+            }
+        }
+
+        private async void btnPairDevice_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                var selectedItem = cmbDevices.SelectedItem as BluetoothDeviceItem;
+                var selectedDevice = selectedItem?.Device;
+                
+                if (selectedDevice == null)
+                {
+                    UpdateStatus("❌ Please select a device to pair.");
+                    return;
+                }
+
+                string pin = txtPairingPin.Text.Trim();
+                if (string.IsNullOrEmpty(pin))
+                {
+                    UpdateStatus("❌ Please enter a pairing PIN.");
+                    return;
+                }
+
+                UpdateStatus($"🔗 Attempting to pair with {selectedDevice.DeviceName}...");
+                btnPairDevice.Enabled = false;
+
+                bool success = await _bluetoothManager.PairWithDeviceAsync(selectedDevice, pin);
+                
+                if (success)
+                {
+                    UpdateStatus($"✅ Successfully paired with {selectedDevice.DeviceName}");
+                    
+                    // Update the device authentication status and refresh UI
+                    selectedDevice.Refresh();
+                    UpdateDeviceSelectionUI();
+                }
+                else
+                {
+                    UpdateStatus($"❌ Failed to pair with {selectedDevice.DeviceName}");
+                    btnPairDevice.Enabled = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"❌ Error during pairing: {ex.Message}");
+                btnPairDevice.Enabled = true;
+            }
+        }
+
+        private async void btnUnpairDevice_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                var selectedItem = cmbDevices.SelectedItem as BluetoothDeviceItem;
+                var selectedDevice = selectedItem?.Device;
+                
+                if (selectedDevice == null)
+                {
+                    UpdateStatus("❌ Please select a device to unpair.");
+                    return;
+                }
+
+                UpdateStatus($"🔓 Attempting to unpair {selectedDevice.DeviceName}...");
+                btnUnpairDevice.Enabled = false;
+
+                bool success = await _bluetoothManager.UnpairDeviceAsync(selectedDevice);
+                
+                if (success)
+                {
+                    UpdateStatus($"✅ Successfully unpaired {selectedDevice.DeviceName}");
+                    
+                    // Update the device authentication status and refresh UI
+                    selectedDevice.Refresh();
+                    UpdateDeviceSelectionUI();
+                }
+                else
+                {
+                    UpdateStatus($"❌ Failed to unpair {selectedDevice.DeviceName}");
+                    btnUnpairDevice.Enabled = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"❌ Error during unpairing: {ex.Message}");
+                btnUnpairDevice.Enabled = true;
+            }
+        }
+
+        private void LoadBluetoothAdapters()
+        {
+            try
+            {
+                _bluetoothManager.DetectBluetoothAdapters();
+                var adapters = _bluetoothManager.AvailableBluetoothAdapters;
+                
+                cmbBluetoothAdapters.Items.Clear();
+                
+                if (adapters.Length == 0)
+                {
+                    UpdateStatus("❌ No Bluetooth adapters found. Please check your Bluetooth hardware.");
+                    lblSelectedAdapter.Text = "No adapters available";
+                    lblSelectedAdapter.ForeColor = Color.Red;
+                    return;
+                }
+
+                for (int i = 0; i < adapters.Length; i++)
+                {
+                    var adapter = adapters[i];
+                    var displayName = $"[{i + 1}] {adapter.Name} ({adapter.LocalAddress})";
+                    cmbBluetoothAdapters.Items.Add(displayName);
+                }
+
+                // Auto-select the preferred adapter (external dongles like TP-Link preferred)
+                bool success = _bluetoothManager.PreferExternalDongle();
+                if (success && _bluetoothManager.SelectedBluetoothAdapter != null)
+                {
+                    // Find the selected adapter in the combo box
+                    var selectedAdapter = _bluetoothManager.SelectedBluetoothAdapter;
+                    for (int i = 0; i < adapters.Length; i++)
+                    {
+                        if (adapters[i].LocalAddress == selectedAdapter.LocalAddress)
+                        {
+                            cmbBluetoothAdapters.SelectedIndex = i;
+                            break;
+                        }
+                    }
+                }
+                else if (cmbBluetoothAdapters.Items.Count > 0)
+                {
+                    cmbBluetoothAdapters.SelectedIndex = 0;
+                }
+
+                UpdateAdapterSelectionUI();
+                UpdateStatus($"✅ Found {adapters.Length} Bluetooth adapter(s).");
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"❌ Error loading Bluetooth adapters: {ex.Message}");
+            }
+        }
+
+        private class BluetoothDeviceItem
+        {
+            public BluetoothDeviceInfo Device { get; set; }
+            
+            public override string ToString()
+            {
+                var deviceName = string.IsNullOrEmpty(Device.DeviceName) ? "Unknown Device" : Device.DeviceName;
+                var pairedStatus = Device.Authenticated ? "✅" : "🔗";
+                return $"{pairedStatus} {deviceName} ({Device.DeviceAddress})";
+            }
+        }
+
+        private void UpdateDeviceSelectionUI()
+        {
+            var selectedItem = cmbDevices.SelectedItem as BluetoothDeviceItem;
+            var selectedDevice = selectedItem?.Device;
+            
+            if (selectedDevice == null)
+            {
+                btnPairDevice.Enabled = false;
+                btnUnpairDevice.Enabled = false;
+                btnConnect.Enabled = false;
+                btnPairDevice.Text = "🔗 Pair Device";
+                return;
+            }
+
+            // Check if device is already paired
+            bool isPaired = selectedDevice.Authenticated;
+            
+            if (isPaired)
+            {
+                btnPairDevice.Text = "✅ Already Paired";
+                btnPairDevice.Enabled = false;
+                btnUnpairDevice.Enabled = true;
+                btnConnect.Enabled = !_bluetoothManager.IsConnected;
+                
+                UpdateStatus($"Selected paired device: {selectedDevice.DeviceName} ({selectedDevice.DeviceAddress})");
+            }
+            else
+            {
+                btnPairDevice.Text = "🔗 Pair Device";
+                btnPairDevice.Enabled = true;
+                btnUnpairDevice.Enabled = false;
+                btnConnect.Enabled = false;
+                
+                UpdateStatus($"Selected unpaired device: {selectedDevice.DeviceName} ({selectedDevice.DeviceAddress}) - pair first");
             }
         }
     }
