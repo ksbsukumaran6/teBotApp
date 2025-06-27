@@ -278,6 +278,87 @@ namespace TeBot
         }
 
         /// <summary>
+        /// Send data immediately without queuing (for real-time Scratch commands)
+        /// </summary>
+        public async Task<bool> SendDataImmediately(byte[] data)
+        {
+            // Validate data size
+            if (data == null || data.Length != DATA_PACKET_SIZE)
+            {
+                StatusChanged?.Invoke($"Invalid data size. Expected {DATA_PACKET_SIZE} bytes, got {data?.Length ?? 0}");
+                return false;
+            }
+
+            if (!_isConnected)
+            {
+                StatusChanged?.Invoke("Not connected to any Bluetooth device");
+                return false;
+            }
+
+            // Use lock to ensure only one immediate command can be sent at a time
+            // This prevents Scratch from sending multiple commands simultaneously
+            return await Task.Run(async () =>
+            {
+                lock (_transmissionLock)
+                {
+                    // Double-check connection inside lock
+                    if (!_isConnected)
+                    {
+                        StatusChanged?.Invoke("Connection lost during command send");
+                        return false;
+                    }
+
+                    // Clear any stale data from receive buffer before sending
+                    ClearReceiveBuffer();
+                }
+
+                // Send directly without queuing (outside lock to allow async)
+                return await SendDataDirectlyAsync(data);
+            });
+        }
+
+        /// <summary>
+        /// Clear any stale data from the receive buffer to ensure clean communication
+        /// </summary>
+        private void ClearReceiveBuffer()
+        {
+            try
+            {
+                int clearedFromQueue = 0;
+                while (_receivedDataQueue.TryDequeue(out byte[] _))
+                {
+                    clearedFromQueue++;
+                }
+                
+                if (clearedFromQueue > 0)
+                {
+                    StatusChanged?.Invoke($"Cleared {clearedFromQueue} stale packets from receive queue");
+                    Debug.WriteLine($"Cleared {clearedFromQueue} stale packets from receive queue");
+                }
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke($"Error clearing receive buffer: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Clear all queued commands (called when Scratch blocks are deactivated)
+        /// </summary>
+        public void ClearQueue()
+        {
+            int clearedCount = 0;
+            while (_dataQueue.TryDequeue(out byte[] _))
+            {
+                clearedCount++;
+            }
+            
+            QueueStatus?.Invoke(0);
+            Debug.WriteLine($"Cleared {clearedCount} commands from queue");
+            StatusChanged?.Invoke($"Cleared {clearedCount} queued commands");
+        }
+
+        /// <summary>
         /// Send a 2D array of data (e.g., dataToSend[10][8])
         /// </summary>
         public async Task<bool> SendDataArrayAsync(byte[][] dataArray)
@@ -490,13 +571,35 @@ namespace TeBot
                 if (_bluetoothStream == null || !_bluetoothStream.CanWrite)
                     return false;
 
-                // At 115200 baud, we can send data much faster - no inter-byte delays needed
+                // CRITICAL FIX: Clear any existing data in our receive queue before sending
+                // This prevents old responses from interfering with new commands
+                int clearedCount = 0;
+                while (_receivedDataQueue.TryDequeue(out byte[] _))
+                {
+                    clearedCount++;
+                }
+                
+                if (clearedCount > 0)
+                {
+                    Debug.WriteLine($"BUFFER CLEAR: Cleared {clearedCount} old responses from queue before sending");
+                    StatusChanged?.Invoke($"BUFFER CLEAR: Cleared {clearedCount} old responses");
+                }
+
+                // Log the exact bytes being sent with detailed info
+                var hexString = BitConverter.ToString(data).Replace("-", " ");
+                var timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
+                Debug.WriteLine($"[{timestamp}] SENDING EXACT BYTES: {hexString} (Length: {data.Length})");
+                StatusChanged?.Invoke($"[{timestamp}] SENDING: {hexString} (Length: {data.Length})");
+                
+                // Send all bytes at once with aggressive flushing
                 await _bluetoothStream.WriteAsync(data, 0, data.Length);
                 await _bluetoothStream.FlushAsync();
                 
-                var hexString = BitConverter.ToString(data).Replace("-", " ");
-                Debug.WriteLine($"Sent (115200 baud): {hexString}");
-                StatusChanged?.Invoke($"Sent (115200 baud): {hexString}");
+                // Add a small delay to ensure the data goes out before any response comes back
+                await Task.Delay(10);
+                
+                StatusChanged?.Invoke($"[{timestamp}] SENT and FLUSHED: {hexString}");
+                Debug.WriteLine($"[{timestamp}] SENT and FLUSHED: {hexString}");
                 
                 return true;
             }

@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
+using System.Diagnostics;
 using System.Drawing;
 using System.Linq;
 using System.Text;
@@ -17,6 +18,7 @@ namespace TeBot
         private BluetoothManager _bluetoothManager;
         private int _dataPacketsSent = 0;
         private int _continuousResponseCount = 0;
+        private volatile bool _isProcessingCommand = false;
 
         public Form1()
         {
@@ -26,7 +28,11 @@ namespace TeBot
         {
             // Initialize WebSocket server
             _webSocketServer = new WebSocketDataServer();
-            _webSocketServer.DataReceived += OnDataReceived;            // Initialize Bluetooth manager
+            _webSocketServer.DataReceived += OnDataReceived;
+            
+            // Subscribe to WebSocket connection events
+            DataReceiver.SessionConnected += OnScratchConnected;
+            DataReceiver.SessionDisconnected += OnScratchDisconnected;            // Initialize Bluetooth manager
             _bluetoothManager = new BluetoothManager();
             _bluetoothManager.StatusChanged += OnBluetoothStatusChanged;
             _bluetoothManager.DevicesDiscovered += OnDevicesDiscovered;
@@ -103,6 +109,15 @@ namespace TeBot
 
         private async Task ProcessScratch8ByteCommand(byte[] data)
         {
+            // Prevent overlapping command processing to avoid buffer corruption
+            if (_isProcessingCommand)
+            {
+                UpdateStatus($"⚠️ Dropping command - already processing another command (prevents buffer corruption)");
+                await SendRawResponseToScratch(new byte[8]); // Send zeros for dropped command
+                return;
+            }
+
+            _isProcessingCommand = true;
             try
             {
                 UpdateStatus($"🔄 Processing 8-byte command from Scratch...");
@@ -113,37 +128,34 @@ namespace TeBot
                     throw new ArgumentException($"Expected 8 bytes, received {data.Length} bytes");
                 }
                 
-                // Log the command details
-                var cmdType = data[0];
-                var param1 = data[1];
-                var param2 = data[2];
-                var param3 = data[3];
+                // Log the exact command being sent (no offset, no shifting)
+                var hexString = BitConverter.ToString(data).Replace("-", " ");
+                UpdateStatus($"📋 Sending exact 8 bytes to robot: {hexString}");
                 
-                UpdateStatus($"📋 Command: 0x{cmdType:X2}, Params: [{param1}, {param2}, {param3}, ...]");
-                
-                // Create array with single packet
-                var packets = new byte[1][];
-                packets[0] = new byte[8];
-                Array.Copy(data, 0, packets[0], 0, 8);
-                
-                // Send to robot
-                bool success = await _bluetoothManager.SendDataArrayAsync(packets);
+                // Send the EXACT same 8 bytes to robot immediately (no modifications)
+                bool success = await _bluetoothManager.SendDataImmediately(data);
                 
                 if (success)
                 {
-                    // Wait for single response packet
+                    UpdateStatus($"✅ Command sent to robot successfully");
+                    
+                    // Wait for robot to respond with 8 bytes
                     var responses = await WaitForResponsesWithTimeout(1, 1000);
                     
                     if (responses.Count > 0)
                     {
-                        UpdateStatus($"✅ Robot responded with {responses[0].Length} bytes");
+                        var robotResponse = responses[0];
+                        var robotHex = BitConverter.ToString(robotResponse).Replace("-", " ");
+                        UpdateStatus($"🤖 Robot responded: {robotHex}");
                         
-                        // Send the 8-byte response directly to Scratch (no padding)
-                        await SendRawResponseToScratch(responses[0]);
+                        // Send the robot's response back to Scratch
+                        await SendRawResponseToScratch(robotResponse);
+                        
+                        UpdateStatus($"📤 Sent robot response back to Scratch");
                     }
                     else
                     {
-                        UpdateStatus($"⚠️ No response from robot");
+                        UpdateStatus($"⚠️ No response from robot within timeout");
                         await SendRawResponseToScratch(new byte[8]); // Send 8 zeros for no response
                     }
                 }
@@ -156,7 +168,11 @@ namespace TeBot
             catch (Exception ex)
             {
                 UpdateStatus($"❌ Error processing 8-byte command: {ex.Message}");
-                await SendResponseToScratch(new List<byte[]>(), false, $"Processing error: {ex.Message}");
+                await SendRawResponseToScratch(new byte[8]); // Send 8 zeros for error
+            }
+            finally
+            {
+                _isProcessingCommand = false;
             }
         }
         
@@ -563,33 +579,80 @@ namespace TeBot
                 btnDisconnect.Enabled = false;
                 UpdateButtonStates(false);
                 
-                UpdateStatus("Disconnecting... (timeout in 8 seconds)");
+                UpdateStatus("Disconnecting... (timeout in 5 seconds)");
                 
-                // Use timeout wrapper to prevent hanging
-                var disconnectTask = _bluetoothManager.DisconnectAsync();
-                var timeoutTask = Task.Delay(8000); // 8 second timeout
+                // Use a shorter timeout and force async execution to prevent GUI hang
+                var disconnectTask = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await _bluetoothManager.DisconnectAsync();
+                        return true;
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"Disconnect error: {ex.Message}");
+                        return false;
+                    }
+                });
+                
+                var timeoutTask = Task.Delay(5000); // 5 second timeout
                 
                 var completedTask = await Task.WhenAny(disconnectTask, timeoutTask);
                 
                 if (completedTask == timeoutTask)
                 {
-                    // Timeout - force disconnect
-                    UpdateStatus("Disconnect timeout - forcing disconnect...");
-                    _bluetoothManager.ForceDisconnect();
-                    UpdateStatus("Force disconnect completed.");
+                    // Timeout - force disconnect immediately without waiting
+                    UpdateStatus("Disconnect timeout - forcing immediate disconnect...");
+                    
+                    // Force disconnect in background task to avoid GUI hang
+                    _ = Task.Run(() =>
+                    {
+                        try
+                        {
+                            _bluetoothManager.ForceDisconnect();
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"Force disconnect error: {ex.Message}");
+                        }
+                    });
+                    
+                    UpdateStatus("Force disconnect initiated.");
                 }
                 else if (disconnectTask.IsFaulted)
                 {
                     // Error in disconnect - force disconnect
                     UpdateStatus($"Disconnect error: {disconnectTask.Exception?.GetBaseException()?.Message}");
                     UpdateStatus("Using force disconnect...");
-                    _bluetoothManager.ForceDisconnect();
-                    UpdateStatus("Force disconnect completed.");
+                    
+                    // Force disconnect in background
+                    _ = Task.Run(() =>
+                    {
+                        try
+                        {
+                            _bluetoothManager.ForceDisconnect();
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"Force disconnect error: {ex.Message}");
+                        }
+                    });
+                    
+                    UpdateStatus("Force disconnect initiated.");
                 }
                 else
                 {
                     // Normal completion
-                    UpdateStatus("Disconnection completed normally.");
+                    var disconnectResult = await disconnectTask;
+                    if (disconnectResult)
+                    {
+                        UpdateStatus("Disconnection completed normally.");
+                    }
+                    else
+                    {
+                        UpdateStatus("Disconnection completed with warnings.");
+                    }
                 }
                 
                 // Always ensure buttons are in correct state
@@ -1353,6 +1416,62 @@ namespace TeBot
             catch (Exception ex)
             {
                 UpdateStatus($"❌ Error sending structured response: {ex.Message}");
+            }
+        }
+
+        private void OnScratchConnected(string sessionId)
+        {
+            UpdateStatus($"🔗 Scratch connected (Session: {sessionId})");
+        }
+
+        private void OnScratchDisconnected(string sessionId)
+        {
+            UpdateStatus($"🔌 Scratch disconnected (Session: {sessionId}) - Stopping all robot operations");
+            
+            try
+            {
+                // CRITICAL: Immediately clear all queues to prevent further commands
+                _bluetoothManager?.ClearQueue();
+                
+                // Stop any continuous operations
+                if (_bluetoothManager?.IsContinuousMode == true)
+                {
+                    _ = Task.Run(() =>
+                    {
+                        try
+                        {
+                            _bluetoothManager.StopContinuousTransmission();
+                            UpdateStatus("🛑 Stopped continuous mode due to Scratch disconnect");
+                        }
+                        catch (Exception ex)
+                        {
+                            UpdateStatus($"⚠️ Error stopping continuous mode: {ex.Message}");
+                        }
+                    });
+                }
+                
+                // Stop any listen-only operations
+                if (_bluetoothManager?.IsListenOnlyMode == true)
+                {
+                    _ = Task.Run(() =>
+                    {
+                        try
+                        {
+                            _bluetoothManager.StopListenOnlyMode();
+                            UpdateStatus("🛑 Stopped listen-only mode due to Scratch disconnect");
+                        }
+                        catch (Exception ex)
+                        {
+                            UpdateStatus($"⚠️ Error stopping listen mode: {ex.Message}");
+                        }
+                    });
+                }
+                
+                UpdateStatus("✅ All operations stopped - no further commands will be sent to robot");
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"❌ Error during Scratch disconnect cleanup: {ex.Message}");
             }
         }
     }

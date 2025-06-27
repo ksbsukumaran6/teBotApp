@@ -1,7 +1,12 @@
 /*
  * TeBot Raspberry Pi Pico Implementation - 8-byte Packet Protocol
  * 
- * This Arduino code implements the TeBot robot side that communicates with
+ * This Arduino co// Communication buffers
+byte commandBuffer[PACKET_SIZE];
+byte syncBuffer[2];
+int bufferIndex = 0;
+int syncState = 0;  // 0=waiting for sync, 1=found first FF
+bool commandReady = false;mplements the TeBot robot side that communicates with
  * the C# Windows Forms application via Bluetooth HC-05 module.
  * 
  * UPDATED PROTOCOL:
@@ -206,27 +211,51 @@ void handleBluetoothData() {
   while (BT_SERIAL.available()) {
     uint8_t receivedByte = BT_SERIAL.read();
     
-    // Simple 8-byte packet collection
-    commandBuffer[bufferIndex++] = receivedByte;
-    
-    // Check if we have a complete 8-byte command
-    if (bufferIndex >= PACKET_SIZE) {
-      commandReady = true;
+    // Look for sync pattern: 0xFF 0xFF (start of new command sequence)
+    if (receivedByte == 0xFF && bufferIndex == 0) {
+      // First sync byte, wait for second
+      syncBuffer[0] = receivedByte;
+      syncState = 1;
+      continue;
+    }
+    else if (receivedByte == 0xFF && syncState == 1) {
+      // Second sync byte found, start collecting command
+      syncBuffer[1] = receivedByte;
+      syncState = 0;
       bufferIndex = 0;
-      lastCommandTime = millis();
-      commandCount++;
+      Serial.println("SYNC: Command start detected");
+      continue;
+    }
+    else if (syncState == 1) {
+      // Not a valid sync sequence, reset
+      syncState = 0;
+      bufferIndex = 0;
+      continue;
+    }
+    
+    // Collect command bytes (only after sync)
+    if (syncState == 0) {
+      commandBuffer[bufferIndex++] = receivedByte;
       
-      // Debug output
-      Serial.print("Command #");
-      Serial.print(commandCount);
-      Serial.print(" received: ");
-      for (int i = 0; i < PACKET_SIZE; i++) {
-        Serial.print("0x");
-        if (commandBuffer[i] < 16) Serial.print("0");
-        Serial.print(commandBuffer[i], HEX);
-        Serial.print(" ");
+      // Check if we have a complete 8-byte command
+      if (bufferIndex >= PACKET_SIZE) {
+        commandReady = true;
+        bufferIndex = 0;
+        lastCommandTime = millis();
+        commandCount++;
+        
+        // Debug output
+        Serial.print("Command #");
+        Serial.print(commandCount);
+        Serial.print(" received: ");
+        for (int i = 0; i < PACKET_SIZE; i++) {
+          Serial.print("0x");
+          if (commandBuffer[i] < 16) Serial.print("0");
+          Serial.print(commandBuffer[i], HEX);
+          Serial.print(" ");
+        }
+        Serial.println();
       }
-      Serial.println();
     }
   }
 }

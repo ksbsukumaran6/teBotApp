@@ -195,13 +195,12 @@ void handleBluetoothData() {
   while (BT_SERIAL.available()) {
     byte receivedByte = BT_SERIAL.read();
     
-    // Simple 8-byte packet collection
+    // Add to buffer
     commandBuffer[bufferIndex++] = receivedByte;
     
     // Check if we have a complete 8-byte command
     if (bufferIndex >= PACKET_SIZE) {
       commandReady = true;
-      bufferIndex = 0;
       lastCommandTime = millis();
       commandCount++;
       
@@ -216,6 +215,24 @@ void handleBluetoothData() {
         Serial.print(" ");
       }
       Serial.println();
+      
+      // Reset buffer index for next command
+      bufferIndex = 0;
+      
+      // Process immediately to prevent queuing
+      processCommand();
+      commandReady = false;
+    }
+    
+    // Safety check: prevent buffer overflow from misaligned data
+    if (bufferIndex >= PACKET_SIZE * 2) {
+      Serial.println("Buffer overflow protection - resetting buffer");
+      bufferIndex = 0;
+      
+      // Clear any remaining bytes in serial buffer
+      while (BT_SERIAL.available()) {
+        BT_SERIAL.read();
+      }
     }
   }
 }
