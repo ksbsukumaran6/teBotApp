@@ -59,34 +59,170 @@ namespace TeBot
             {
                 if (_bluetoothManager.IsConnected)
                 {
-                    // Fire and forget - don't wait for completion to reduce lag
-                    _ = Task.Run(async () =>
+                    UpdateStatus($"📨 Received {data.Length} bytes from Scratch - processing...");
+                    
+                    // Process data based on format
+                    if (data.Length == 80)
                     {
-                        bool success = await _bluetoothManager.SendDataAsync(data);
-                        if (success)
-                        {
-                            Interlocked.Increment(ref _dataPacketsSent);
-                            
-                            // Update UI less frequently to reduce overhead
-                            if (_dataPacketsSent % 3 == 0) // Update every 3rd packet
-                            {
-                                BeginInvoke(new Action(() =>
-                                {
-                                    lblDataCount.Text = $"Data packets sent: {_dataPacketsSent}";
-                                }));
-                            }
-                        }
-                    });
+                        // Direct 80-byte format - split into 10 packets of 8 bytes
+                        await ProcessScratchCommand80Bytes(data);
+                    }
+                    else if (data.Length > 80 && IsJsonData(data))
+                    {
+                        // JSON format
+                        await ProcessScratchCommandJson(data);
+                    }
+                    else
+                    {
+                        UpdateStatus($"❌ Invalid data format from Scratch. Expected 80 bytes or JSON. Received: {data.Length} bytes");
+                        await SendResponseToScratch(new List<byte[]>(), false, "Invalid data format");
+                    }
                 }
                 else
                 {
-                    await Task.Delay(1); // Make method properly async
-                    UpdateStatus("Received data but no Bluetooth device connected");
+                    UpdateStatus("❌ Received Scratch command but robot not connected");
+                    await SendResponseToScratch(new List<byte[]>(), false, "Robot not connected");
                 }
             }
             catch (Exception ex)
             {
-                UpdateStatus($"Error processing received data: {ex.Message}");
+                UpdateStatus($"❌ Error processing Scratch data: {ex.Message}");
+                await SendResponseToScratch(new List<byte[]>(), false, $"Processing error: {ex.Message}");
+            }
+        }
+
+        private async Task ProcessScratchCommand80Bytes(byte[] data)
+        {
+            try
+            {
+                // Split 80 bytes into 10 packets of 8 bytes each
+                var packets = new byte[10][];
+                for (int i = 0; i < 10; i++)
+                {
+                    packets[i] = new byte[8];
+                    Array.Copy(data, i * 8, packets[i], 0, 8);
+                }
+
+                UpdateStatus($"🔄 Sending 10 packets (80 bytes) to robot...");
+                
+                // Send to robot and wait for response
+                bool success = await _bluetoothManager.SendDataArrayAsync(packets);
+                
+                if (success)
+                {
+                    // Wait for robot response (10 packets back)
+                    var responses = await WaitForResponsesWithTimeout(10, 2000);
+                    
+                    UpdateStatus($"✅ Robot responded: {responses.Count}/10 packets received");
+                    
+                    // Send response back to Scratch
+                    await SendResponseToScratch(responses, true, "Success");
+                    
+                    // Update counters
+                    Interlocked.Increment(ref _dataPacketsSent);
+                    BeginInvoke(new Action(() =>
+                    {
+                        lblDataCount.Text = $"Scratch commands processed: {_dataPacketsSent}";
+                    }));
+                }
+                else
+                {
+                    UpdateStatus("❌ Failed to send data to robot");
+                    await SendResponseToScratch(new List<byte[]>(), false, "Robot send failed");
+                }
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"❌ Error in 80-byte processing: {ex.Message}");
+                await SendResponseToScratch(new List<byte[]>(), false, $"80-byte processing error: {ex.Message}");
+            }
+        }
+
+        private async Task ProcessScratchCommandJson(byte[] data)
+        {
+            try
+            {
+                string jsonString = Encoding.UTF8.GetString(data);
+                UpdateStatus($"📋 Processing JSON command from Scratch...");
+                
+                // Simple JSON parsing (you can use System.Text.Json for more robust parsing)
+                if (jsonString.Contains("\"command\":\"send_data\"") && jsonString.Contains("\"data\":["))
+                {
+                    // Extract data array from JSON (simplified parsing)
+                    var dataStart = jsonString.IndexOf("\"data\":[") + 8;
+                    var dataEnd = jsonString.IndexOf("]", dataStart);
+                    var dataArrayStr = jsonString.Substring(dataStart, dataEnd - dataStart);
+                    
+                    var byteValues = dataArrayStr.Split(',').Select(s => byte.Parse(s.Trim())).ToArray();
+                    
+                    if (byteValues.Length == 80)
+                    {
+                        await ProcessScratchCommand80Bytes(byteValues);
+                    }
+                    else
+                    {
+                        UpdateStatus($"❌ JSON data array must be exactly 80 bytes. Received: {byteValues.Length}");
+                        await SendResponseToScratch(new List<byte[]>(), false, $"Invalid data size: {byteValues.Length}");
+                    }
+                }
+                else
+                {
+                    UpdateStatus("❌ Invalid JSON format from Scratch");
+                    await SendResponseToScratch(new List<byte[]>(), false, "Invalid JSON format");
+                }
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"❌ Error parsing JSON: {ex.Message}");
+                await SendResponseToScratch(new List<byte[]>(), false, $"JSON parsing error: {ex.Message}");
+            }
+        }
+
+        private bool IsJsonData(byte[] data)
+        {
+            try
+            {
+                string text = Encoding.UTF8.GetString(data);
+                return text.TrimStart().StartsWith("{") && text.TrimEnd().EndsWith("}");
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private async Task SendResponseToScratch(List<byte[]> robotResponses, bool success, string message)
+        {
+            try
+            {
+                byte[] responseData;
+                
+                if (robotResponses.Count > 0)
+                {
+                    // Convert responses back to 80-byte format
+                    responseData = new byte[80];
+                    for (int i = 0; i < Math.Min(robotResponses.Count, 10); i++)
+                    {
+                        Array.Copy(robotResponses[i], 0, responseData, i * 8, Math.Min(robotResponses[i].Length, 8));
+                    }
+                    
+                    UpdateStatus($"📤 Sending 80 bytes back to Scratch (from {robotResponses.Count} robot packets)");
+                }
+                else
+                {
+                    // Send zeros if no response
+                    responseData = new byte[80];
+                    UpdateStatus($"📤 Sending empty response to Scratch: {message}");
+                }
+                
+                // Send response back through WebSocket
+                await _webSocketServer.SendToAllClientsAsync(responseData);
+                
+                UpdateStatus($"✅ Response sent to Scratch: Success={success}, {message}");
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"❌ Error sending response to Scratch: {ex.Message}");
             }
         }
 
@@ -171,6 +307,7 @@ namespace TeBot
                 
                 if (devices.Length > 0)
                 {
+                    cmbDevices.Enabled = true; // Enable device selection when devices are found
                     UpdateStatus($"Found {devices.Length} Bluetooth devices. Select one to pair/connect.");
                     
                     // Show breakdown of paired vs unpaired
@@ -199,6 +336,7 @@ namespace TeBot
                 }
                 else
                 {
+                    cmbDevices.Enabled = false; // Disable device selection when no devices found
                     UpdateStatus("❌ No Bluetooth devices found. Make sure devices are discoverable and try scanning again.");
                     UpdateStatus("💡 Tip: Put your robot/device in pairing/discoverable mode and scan again.");
                 }

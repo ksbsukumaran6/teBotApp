@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text;
 using System.Threading;
@@ -12,6 +13,8 @@ namespace TeBot
     public class DataReceiver : WebSocketBehavior
     {
         public static event Action<byte[]> GlobalDataReceived;
+        public static event Action<string> SessionConnected;
+        public static event Action<string> SessionDisconnected;
 
         protected override void OnMessage(MessageEventArgs e)
         {
@@ -33,12 +36,14 @@ namespace TeBot
 
         protected override void OnOpen()
         {
-            Debug.WriteLine("WebSocket client connected");
+            Debug.WriteLine($"WebSocket client connected: {ID}");
+            SessionConnected?.Invoke(ID);
         }
 
         protected override void OnClose(CloseEventArgs e)
         {
-            Debug.WriteLine($"WebSocket client disconnected: {e.Reason}");
+            Debug.WriteLine($"WebSocket client disconnected: {ID}, Reason: {e.Reason}");
+            SessionDisconnected?.Invoke(ID);
         }
 
         protected override void OnError(ErrorEventArgs e)
@@ -51,6 +56,7 @@ namespace TeBot
     {
         private WebSocketServer _server;
         private bool _isRunning;
+        private readonly ConcurrentDictionary<string, IWebSocketSession> _sessions = new ConcurrentDictionary<string, IWebSocketSession>();
 
         public event Action<byte[]> DataReceived;
 
@@ -74,8 +80,10 @@ namespace TeBot
                 
                 _server.AddWebSocketService<DataReceiver>("/");
                 
-                // Subscribe to the global event
+                // Subscribe to the global events
                 DataReceiver.GlobalDataReceived += OnDataReceived;
+                DataReceiver.SessionConnected += OnSessionConnected;
+                DataReceiver.SessionDisconnected += OnSessionDisconnected;
 
                 _server.Start();
                 _isRunning = true;
@@ -96,8 +104,11 @@ namespace TeBot
                 if (_server != null && _isRunning)
                 {
                     DataReceiver.GlobalDataReceived -= OnDataReceived;
+                    DataReceiver.SessionConnected -= OnSessionConnected;
+                    DataReceiver.SessionDisconnected -= OnSessionDisconnected;
                     _server.Stop();
                     _isRunning = false;
+                    _sessions.Clear();
                     Debug.WriteLine("WebSocket server stopped");
                 }
             }
@@ -110,6 +121,51 @@ namespace TeBot
         private void OnDataReceived(byte[] data)
         {
             DataReceived?.Invoke(data);
+        }
+
+        private void OnSessionConnected(string sessionId)
+        {
+            Debug.WriteLine($"Session connected: {sessionId}");
+        }
+
+        private void OnSessionDisconnected(string sessionId)
+        {
+            Debug.WriteLine($"Session disconnected: {sessionId}");
+            _sessions.TryRemove(sessionId, out _);
+        }
+
+        /// <summary>
+        /// Send binary data to all connected WebSocket clients
+        /// </summary>
+        /// <param name="data">The binary data to send</param>
+        /// <returns>Task representing the async operation</returns>
+        public Task SendToAllClientsAsync(byte[] data)
+        {
+            if (!_isRunning || _server == null)
+            {
+                Debug.WriteLine("Cannot send data: server is not running");
+                return Task.CompletedTask;
+            }
+
+            try
+            {
+                var service = _server.WebSocketServices["/"];
+                if (service?.Sessions?.Count > 0)
+                {
+                    service.Sessions.Broadcast(data);
+                    Debug.WriteLine($"Sent {data.Length} bytes to {service.Sessions.Count} connected clients");
+                }
+                else
+                {
+                    Debug.WriteLine("No connected clients to send data to");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error sending data to clients: {ex.Message}");
+            }
+            
+            return Task.CompletedTask;
         }
 
         public void Dispose()
