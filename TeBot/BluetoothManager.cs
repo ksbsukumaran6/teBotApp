@@ -22,6 +22,7 @@ namespace TeBot
           // Data transmission management
         private readonly ConcurrentQueue<byte[]> _dataQueue = new ConcurrentQueue<byte[]>();
         private readonly ConcurrentQueue<byte[]> _receivedDataQueue = new ConcurrentQueue<byte[]>();
+        private readonly SemaphoreSlim _responseAvailableSemaphore = new SemaphoreSlim(0);
         private readonly List<List<byte[]>> _receivedLists = new List<List<byte[]>>();
         private Timer _transmissionTimer;
         private CancellationTokenSource _transmissionCancellation;
@@ -732,7 +733,19 @@ namespace TeBot
                             }
                         }
                         
-                        StatusChanged?.Invoke($"=== END 82-byte block ===");
+                        // Signal that a complete 82-byte response is available (10 packets)
+                        // Only release if semaphore count is 0 to prevent accumulation
+                        if (_responseAvailableSemaphore.CurrentCount == 0)
+                        {
+                            _responseAvailableSemaphore.Release();
+                            Debug.WriteLine($"ProcessNormalModeData: Released semaphore for 82-byte response");
+                        }
+                        else
+                        {
+                            Debug.WriteLine($"ProcessNormalModeData: Semaphore already signaled (count: {_responseAvailableSemaphore.CurrentCount})");
+                        }
+                        
+                        StatusChanged?.Invoke($"=== END 82-byte block (queue: {_receivedDataQueue.Count} packets) ===");
                         
                         var responseHex = BitConverter.ToString(fullResponse, 0, Math.Min(16, fullResponse.Length)).Replace("-", " ");
                         Debug.WriteLine($"Processed 82-byte continuous response: {responseHex}...");
@@ -1045,6 +1058,7 @@ namespace TeBot
                 // Dispose remaining resources
                 try { _flushTimer?.Dispose(); } catch { }
                 try { _dataAvailable?.Dispose(); } catch { }
+                try { _responseAvailableSemaphore?.Dispose(); } catch { }
             }
             catch (Exception ex)
             {
@@ -1085,10 +1099,10 @@ namespace TeBot
             QueueStatus?.Invoke(0);            _isContinuousMode = true;
             _continuousPacketCounter = 0;
             
-            // Start continuous transmission timer (250ms interval for robot processing time)
-            _continuousTransmissionTimer = new Timer(ContinuousTransmissionCallback, null, 0, CONTINUOUS_TRANSMISSION_INTERVAL_MS);
+            // Start continuous transmission timer (one-shot mode, we'll restart it after each cycle)
+            _continuousTransmissionTimer = new Timer(ContinuousTransmissionCallback, null, 0, Timeout.Infinite);
             
-            StatusChanged?.Invoke("Started MASTER continuous transmission mode (marker + 10 packets every 200ms, optimized for 115200 baud)");
+            StatusChanged?.Invoke("Started MASTER continuous transmission mode (82-byte send + wait for 82-byte response every 500ms)");
         }        /// <summary>
         /// Stop continuous transmission mode
         /// </summary>
@@ -1111,135 +1125,134 @@ namespace TeBot
                 StatusChanged?.Invoke("Regular transmission system restarted");
             }            
             StatusChanged?.Invoke("Stopped continuous transmission mode");
-        }        private async void ContinuousTransmissionCallback(object state)
+        }
+
+        private async void ContinuousTransmissionCallback(object state)
         {
             if (!_isConnected || !_isContinuousMode)
                 return;
 
+            var cycleStartTime = DateTime.Now;
+            var consecutiveTimeouts = 0;
+            const int maxConsecutiveTimeouts = 5; // Stop after 5 consecutive timeouts
+
             try
             {
-                // Create a single buffer containing marker + all 80 bytes (10 packets)
-                // This ensures atomic transmission and prevents marker bytes from being lost
-                var totalBuffer = new byte[82]; // 2 bytes marker + 80 bytes data
-                totalBuffer[0] = 0xAA; // Marker byte 1
-                totalBuffer[1] = 0x55; // Marker byte 2
+                var startTime = DateTime.Now;
+                
+                // Create 82-byte master command (marker + 10 packets of 8 bytes each)
+                var masterCommand = new byte[82]; // 2 bytes marker + 80 bytes data
+                masterCommand[0] = 0xAA; // Marker byte 1
+                masterCommand[1] = 0x55; // Marker byte 2
                 
                 // Generate 10 packets directly into the buffer after the marker
                 for (int i = 0; i < 10; i++)
                 {
                     int bufferOffset = 2 + (i * 8); // Start after marker bytes
                     
-                    totalBuffer[bufferOffset + 0] = 0x07; // Command identifier
-                    totalBuffer[bufferOffset + 1] = (byte)(i + 1); // Packet number within list (1-10)
-                    totalBuffer[bufferOffset + 2] = (byte)((_continuousPacketCounter >> 8) & 0xFF); // High byte of counter
-                    totalBuffer[bufferOffset + 3] = (byte)(_continuousPacketCounter & 0xFF); // Low byte of counter
-                    totalBuffer[bufferOffset + 4] = (byte)(i * 10); // Sequence within packet
-                    totalBuffer[bufferOffset + 5] = 0x55; // Test marker
-                    totalBuffer[bufferOffset + 6] = 0xBB; // Test marker
-                    totalBuffer[bufferOffset + 7] = (byte)(255 - (i * 10)); // Checksum-like value
+                    masterCommand[bufferOffset + 0] = 0x07; // Command identifier
+                    masterCommand[bufferOffset + 1] = (byte)(i + 1); // Packet number within list (1-10)
+                    masterCommand[bufferOffset + 2] = (byte)((_continuousPacketCounter >> 8) & 0xFF); // High byte of counter
+                    masterCommand[bufferOffset + 3] = (byte)(_continuousPacketCounter & 0xFF); // Low byte of counter
+                    masterCommand[bufferOffset + 4] = (byte)(i * 10); // Sequence within packet
+                    masterCommand[bufferOffset + 5] = 0x55; // Test marker
+                    masterCommand[bufferOffset + 6] = 0xBB; // Test marker
+                    masterCommand[bufferOffset + 7] = (byte)(255 - (i * 10)); // Checksum-like value
                     
                     _continuousPacketCounter++;
-                }                // Send master command at 115200 baud - much faster than 9600
+                }
+
+                // STEP 1: Send 82-byte master command
                 if (_bluetoothStream != null && _bluetoothStream.CanWrite)
                 {
-                    StatusChanged?.Invoke($"MASTER: Sending 82-byte command to slave at 115200 baud...");
+                    StatusChanged?.Invoke($"MASTER: Sending 82-byte command #{_continuousPacketCounter / 10}...");
                     
-                    // At 115200 baud, send entire buffer at once for maximum speed
-                    await _bluetoothStream.WriteAsync(totalBuffer, 0, totalBuffer.Length);
+                    await _bluetoothStream.WriteAsync(masterCommand, 0, masterCommand.Length);
                     await _bluetoothStream.FlushAsync();
                     
-                    var markerHex = BitConverter.ToString(totalBuffer, 0, 2).Replace("-", " ");
-                    var firstPacketHex = BitConverter.ToString(totalBuffer, 2, 8).Replace("-", " ");
-                    Debug.WriteLine($"MASTER sent 82-byte command: Marker=[{markerHex}] FirstPacket=[{firstPacketHex}] ...");
-                    StatusChanged?.Invoke($"MASTER: Sent command #{_continuousPacketCounter / 10} to slave (Marker: {markerHex}, 82 bytes total)");
+                    var markerHex = BitConverter.ToString(masterCommand, 0, 2).Replace("-", " ");
+                    Debug.WriteLine($"MASTER sent 82-byte command: Marker=[{markerHex}] at {DateTime.Now:HH:mm:ss.fff}");
                 }
-                  // Start collecting responses for this batch - much faster at 115200 baud
-                _ = Task.Run(() => CollectContinuousResponses(10));
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Error in continuous transmission: {ex.Message}");
-            }
-        }        private async Task CollectContinuousResponses(int expectedCount)
-        {
-            var responses = new List<byte[]>();
-            var timeout = DateTime.Now.AddMilliseconds(150); // Much shorter timeout for 115200 baud (was 800ms)
-            var allReceivedBytes = new List<byte>();
-            
-            while (responses.Count < expectedCount && DateTime.Now < timeout && _isConnected && _isContinuousMode)
-            {
-                if (_receivedDataQueue.TryDequeue(out byte[] receivedData))
+                
+                // STEP 2: Wait for exactly 82 bytes response (timeout: 220ms - increased for better reliability)
+                Debug.WriteLine($"MASTER: Waiting for slave response (timeout: 220ms) at {DateTime.Now:HH:mm:ss.fff}");
+                var response = await WaitForSlaveResponse(220);
+                
+                if (response != null && response.Length == 82)
                 {
-                    allReceivedBytes.AddRange(receivedData);
+                    StatusChanged?.Invoke($"✅ MASTER: Received 82-byte slave response");
+                    consecutiveTimeouts = 0; // Reset timeout counter on successful response
                     
-                    // Show each received chunk in debug
-                    var hexString = BitConverter.ToString(receivedData).Replace("-", " ");
-                    Debug.WriteLine($"Continuous chunk {allReceivedBytes.Count} bytes received: {hexString}");
-                    StatusChanged?.Invoke($"Continuous: Received chunk ({receivedData.Length} bytes): {hexString}");
+                    // Process the 82-byte response (marker + 10 packets)
+                    var responseMarker = BitConverter.ToString(response, 0, 2).Replace("-", " ");
+                    Debug.WriteLine($"SLAVE response received: Marker=[{responseMarker}] at {DateTime.Now:HH:mm:ss.fff}");
                     
-                    // Check if we have received a complete 82-byte response (2-byte marker + 80 bytes data)
-                    if (allReceivedBytes.Count >= 82)
+                    // Parse response into individual packets and fire event
+                    var responsePackets = new List<byte[]>();
+                    for (int i = 0; i < 10; i++)
                     {
-                        var fullResponse = allReceivedBytes.Take(82).ToArray();
-                        allReceivedBytes.RemoveRange(0, 82);
-                        
-                        // Parse the 82-byte response into marker + 10 packets
-                        var marker = fullResponse.Take(2).ToArray();
-                        var markerHex = BitConverter.ToString(marker).Replace("-", " ");
-                        
-                        StatusChanged?.Invoke($"=== CONTINUOUS RESPONSE BLOCK (82 bytes) ===");
-                        StatusChanged?.Invoke($"Marker: {markerHex}");
-                        StatusChanged?.Invoke($"Data packets (10 x 8 bytes):");
-                        
-                        // Extract and display each 8-byte packet
-                        for (int i = 0; i < 10; i++)
+                        int packetStart = 2 + (i * 8); // Skip 2-byte marker
+                        if (packetStart + 8 <= response.Length)
                         {
-                            int packetStart = 2 + (i * 8); // Skip 2-byte marker
-                            if (packetStart + 8 <= fullResponse.Length)
-                            {
-                                var packet = new byte[8];
-                                Array.Copy(fullResponse, packetStart, packet, 0, 8);
-                                responses.Add(packet);
-                                
-                                var packetHex = BitConverter.ToString(packet).Replace("-", " ");
-                                StatusChanged?.Invoke($"  Packet {i + 1}: {packetHex}");
-                                Debug.WriteLine($"Continuous packet {i + 1}/10: {packetHex}");
-                            }
+                            var packet = new byte[8];
+                            Array.Copy(response, packetStart, packet, 0, 8);
+                            responsePackets.Add(packet);
                         }
-                        
-                        StatusChanged?.Invoke($"=== END RESPONSE BLOCK ===");
-                        break; // We've processed a complete 82-byte block
                     }
-                    else
+                    
+                    // Fire event with the response packets
+                    if (responsePackets.Count > 0)
                     {
-                        // Still collecting bytes for the 82-byte block
-                        StatusChanged?.Invoke($"Continuous: Collecting... {allReceivedBytes.Count}/82 bytes received");
+                        ContinuousResponseReceived?.Invoke(responsePackets);
                     }
                 }
                 else
                 {
-                    await Task.Delay(5); // Shorter delay for 115200 baud
+                    consecutiveTimeouts++;
+                    StatusChanged?.Invoke($"❌ MASTER: No valid 82-byte response from slave (timeout 220ms) - consecutive timeouts: {consecutiveTimeouts}");
+                    Debug.WriteLine($"MASTER: Response timeout at {DateTime.Now:HH:mm:ss.fff} - consecutive: {consecutiveTimeouts}");
+                    
+                    // Stop continuous transmission if too many consecutive timeouts
+                    if (consecutiveTimeouts >= maxConsecutiveTimeouts)
+                    {
+                        StatusChanged?.Invoke($"🔴 MASTER: Stopping continuous transmission after {maxConsecutiveTimeouts} consecutive timeouts");
+                        StopContinuousTransmission();
+                        return;
+                    }
+                }
+                
+                // STEP 3: Ensure we wait until the full 500ms interval is complete
+                var elapsed = DateTime.Now - startTime;
+                var remainingTime = TimeSpan.FromMilliseconds(500) - elapsed;
+                
+                if (remainingTime.TotalMilliseconds > 10) // Only wait if there's meaningful time left
+                {
+                    Debug.WriteLine($"MASTER: Waiting {remainingTime.TotalMilliseconds:F0}ms to complete 500ms interval (elapsed: {elapsed.TotalMilliseconds:F0}ms)");
+                    await Task.Delay(remainingTime);
+                }
+                else if (remainingTime.TotalMilliseconds < 0)
+                {
+                    Debug.WriteLine($"MASTER: Cycle took {elapsed.TotalMilliseconds:F0}ms - {Math.Abs(remainingTime.TotalMilliseconds):F0}ms over target 500ms");
+                }
+                
+                // STEP 4: Schedule next transmission (if still in continuous mode)
+                if (_isConnected && _isContinuousMode && _continuousTransmissionTimer != null)
+                {
+                    _continuousTransmissionTimer.Change(0, Timeout.Infinite);
                 }
             }
-            
-            // Fire event with collected responses and show summary
-            if (responses.Count > 0)
+            catch (Exception ex)
             {
-                ContinuousResponseReceived?.Invoke(responses);
-                var totalBytes = responses.Sum(r => r.Length);
-                StatusChanged?.Invoke($"Continuous: Successfully parsed {responses.Count}/10 packets ({totalBytes} bytes total) at 115200 baud");
-            }
-            else if (allReceivedBytes.Count > 0)
-            {
-                // We received some data but not a complete 82-byte block
-                var partialHex = BitConverter.ToString(allReceivedBytes.ToArray()).Replace("-", " ");
-                StatusChanged?.Invoke($"Continuous: Incomplete response - received {allReceivedBytes.Count} bytes: {partialHex}");
-            }
-            else
-            {
-                StatusChanged?.Invoke($"Continuous: No responses received in 150ms window (115200 baud)");
+                StatusChanged?.Invoke($"Error in continuous transmission: {ex.Message}");
+                
+                // Still try to schedule next transmission if we're still connected
+                if (_isConnected && _isContinuousMode && _continuousTransmissionTimer != null)
+                {
+                    _continuousTransmissionTimer.Change(500, Timeout.Infinite);
+                }
             }
         }
+        
         
         /// <summary>
         /// Start listen-only mode - just receive and display data from robot
@@ -1390,6 +1403,12 @@ namespace TeBot
                     while (_dataQueue.TryDequeue(out _)) { }
                     while (_receivedDataQueue.TryDequeue(out _)) { }
                     _dataAvailable.Reset();
+                    
+                    // Clear any pending semaphore signals
+                    while (_responseAvailableSemaphore.CurrentCount > 0)
+                    {
+                        _responseAvailableSemaphore.Wait(0);
+                    }
                 } 
                 catch { }
                 
@@ -1837,6 +1856,108 @@ namespace TeBot
             catch
             {
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// Wait for exactly 82 bytes response from slave device within specified timeout
+        /// This method works with the existing data processing pipeline by checking the received queue
+        /// </summary>
+        /// <param name="timeoutMs">Timeout in milliseconds</param>
+        /// <returns>82-byte response array or null if timeout/error</returns>
+        private async Task<byte[]> WaitForSlaveResponse(int timeoutMs)
+        {
+            var startTime = DateTime.Now;
+            
+            try
+            {
+                // Wait for the semaphore to be signaled (indicating a complete 82-byte response is available)
+                var waitSuccess = await _responseAvailableSemaphore.WaitAsync(timeoutMs);
+                
+                if (!waitSuccess)
+                {
+                    var timeoutElapsed = DateTime.Now - startTime;
+                    Debug.WriteLine($"WaitForSlaveResponse: Timeout after {timeoutElapsed.TotalMilliseconds:F0}ms - no complete response available");
+                    
+                    // Check if we have any partial data in the queue that might indicate communication is working
+                    var queueCount = _receivedDataQueue.Count;
+                    if (queueCount > 0)
+                    {
+                        Debug.WriteLine($"WaitForSlaveResponse: Queue has {queueCount} packets - partial response detected");
+                    }
+                    
+                    return null;
+                }
+                
+                // If we get here, a complete 82-byte response should be available as 10 packets
+                var collectedPackets = new List<byte[]>();
+                var maxRetries = 3; // Allow a few retries in case of timing issues
+                var retryCount = 0;
+                
+                // Collect exactly 10 packets to reconstruct the 82-byte response
+                while (collectedPackets.Count < 10 && retryCount < maxRetries)
+                {
+                    for (int i = collectedPackets.Count; i < 10; i++)
+                    {
+                        if (_receivedDataQueue.TryDequeue(out byte[] packet))
+                        {
+                            collectedPackets.Add(packet);
+                        }
+                        else
+                        {
+                            // This might happen if packets are still being processed - wait a bit
+                            if (retryCount < maxRetries - 1)
+                            {
+                                Debug.WriteLine($"WaitForSlaveResponse: Missing packet {i + 1}/10 - retrying (attempt {retryCount + 1}/{maxRetries})");
+                                await Task.Delay(5); // Small delay to allow processing
+                                break;
+                            }
+                            else
+                            {
+                                Debug.WriteLine($"WaitForSlaveResponse: Missing packet {i + 1}/10 - data integrity issue after {maxRetries} attempts");
+                            }
+                        }
+                    }
+                    
+                    if (collectedPackets.Count < 10)
+                    {
+                        retryCount++;
+                    }
+                }
+                
+                if (collectedPackets.Count == 10)
+                {
+                    // Reconstruct the original 82-byte response with AA 55 marker
+                    var response = new byte[82];
+                    response[0] = 0xAA; // Marker
+                    response[1] = 0x55; // Marker
+                    
+                    // Copy the 10 packets (80 bytes) after the marker
+                    for (int i = 0; i < 10; i++)
+                    {
+                        Array.Copy(collectedPackets[i], 0, response, 2 + (i * 8), 8);
+                    }
+                    
+                    var elapsed = DateTime.Now - startTime;
+                    Debug.WriteLine($"WaitForSlaveResponse: Got complete 82-byte response after {elapsed.TotalMilliseconds:F0}ms (retries: {retryCount})");
+                    return response;
+                }
+                else
+                {
+                    // Put back any packets we collected but couldn't complete the response
+                    foreach (var packet in collectedPackets)
+                    {
+                        _receivedDataQueue.Enqueue(packet);
+                    }
+                    
+                    Debug.WriteLine($"WaitForSlaveResponse: Incomplete response - only got {collectedPackets.Count}/10 packets after {maxRetries} attempts");
+                    return null;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"WaitForSlaveResponse: Exception - {ex.Message}");
+                return null;
             }
         }
     }

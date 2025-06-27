@@ -516,7 +516,7 @@ namespace TeBot
                 // Update all button states based on new mode
                 UpdateButtonStates(true);
                 
-                UpdateStatus("Started continuous transmission mode (10 packets every 200ms)");
+                UpdateStatus("Started continuous transmission mode (10 packets every 500ms)");
             }
             catch (Exception ex)
             {
