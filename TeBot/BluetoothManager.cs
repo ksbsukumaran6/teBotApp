@@ -278,14 +278,12 @@ namespace TeBot
         }
 
         /// <summary>
-        /// Send data immediately without queuing (for real-time Scratch commands)
+        /// Send data immediately - simple bridge from Scratch to robot
         /// </summary>
         public async Task<bool> SendDataImmediately(byte[] data)
         {
-            // Validate data size
-            if (data == null || data.Length != DATA_PACKET_SIZE)
+            if (data == null || data.Length == 0)
             {
-                StatusChanged?.Invoke($"Invalid data size. Expected {DATA_PACKET_SIZE} bytes, got {data?.Length ?? 0}");
                 return false;
             }
 
@@ -295,64 +293,16 @@ namespace TeBot
                 return false;
             }
 
-            // Use lock to ensure only one immediate command can be sent at a time
-            // This prevents Scratch from sending multiple commands simultaneously
-            return await Task.Run(async () =>
+            try
             {
-                lock (_transmissionLock)
-                {
-                    // Double-check connection inside lock
-                    if (!_isConnected)
-                    {
-                        StatusChanged?.Invoke("Connection lost during command send");
-                        return false;
-                    }
-
-                    // CRITICAL: Clear any stale data from receive buffer before sending
-                    // This prevents the 1-byte offset issue
-                    ClearReceiveBuffer();
-                    
-                    // Also clear any stale data from our internal queues
-                    while (_receivedDataQueue.TryDequeue(out byte[] _)) { }
-                    
-                    // EXTRA AGGRESSIVE: Clear the main data queue too to prevent any interference
-                    while (_dataQueue.TryDequeue(out byte[] _)) { }
-                    
-                    StatusChanged?.Invoke("🧹 ULTRA CLEAR: All buffers, queues, and data cleared before sending");
-                }
-
-                // PAUSE DATA READING: Temporarily stop background reading to prevent interference
-                bool wasReading = _isReading;
-                if (wasReading)
-                {
-                    // We can't easily stop the reading thread, but we can prevent it from processing
-                    StatusChanged?.Invoke("⏸️ Pausing data reading during command send");
-                }
-
-                try
-                {
-                    // Verify the exact data we're about to send (debug check)
-                    var preHex = BitConverter.ToString(data).Replace("-", " ");
-                    StatusChanged?.Invoke($"🔍 PRE-SEND VERIFICATION: Data to send = {preHex}");
-                    
-                    // Send directly without queuing (outside lock to allow async)
-                    var result = await SendDataDirectlyAsync(data);
-                    
-                    if (result)
-                    {
-                        StatusChanged?.Invoke("✅ Command sent successfully - buffers clear, byte-by-byte send, no offset");
-                    }
-                    
-                    return result;
-                }
-                finally
-                {
-                    if (wasReading)
-                    {
-                        StatusChanged?.Invoke("▶️ Resuming data reading after command send");
-                    }
-                }
-            });
+                // SIMPLE: Just send the data directly to robot
+                return await SendDataDirectlyAsync(data);
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke($"Error sending data: {ex.Message}");
+                return false;
+            }
         }
 
         /// <summary>
@@ -609,44 +559,9 @@ namespace TeBot
                 if (_bluetoothStream == null || !_bluetoothStream.CanWrite)
                     return false;
 
-                // CRITICAL FIX: Clear any existing data in our receive queue before sending
-                // This prevents old responses from interfering with new commands
-                int clearedCount = 0;
-                while (_receivedDataQueue.TryDequeue(out byte[] _))
-                {
-                    clearedCount++;
-                }
-                
-                if (clearedCount > 0)
-                {
-                    Debug.WriteLine($"BUFFER CLEAR: Cleared {clearedCount} old responses from queue before sending");
-                    StatusChanged?.Invoke($"BUFFER CLEAR: Cleared {clearedCount} old responses");
-                }
-
-                // Log the exact bytes being sent with detailed info
-                var hexString = BitConverter.ToString(data).Replace("-", " ");
-                var timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
-                Debug.WriteLine($"[{timestamp}] SENDING EXACT BYTES: {hexString} (Length: {data.Length})");
-                StatusChanged?.Invoke($"[{timestamp}] SENDING: {hexString} (Length: {data.Length})");
-                
-                // DIRECT SEND: Write each byte individually to ensure no buffering interference
-                // This prevents the 1-byte offset issue by being very explicit about what gets sent
-                for (int i = 0; i < data.Length; i++)
-                {
-                    await _bluetoothStream.WriteAsync(new byte[] { data[i] }, 0, 1);
-                }
-                
-                // Flush aggressively after sending all bytes
+                // SIMPLE: Write data and flush immediately
+                await _bluetoothStream.WriteAsync(data, 0, data.Length);
                 await _bluetoothStream.FlushAsync();
-                
-                // Double flush to ensure bytes go out immediately
-                await _bluetoothStream.FlushAsync();
-                
-                // Add a small delay to ensure the data goes out completely
-                await Task.Delay(15);
-                
-                StatusChanged?.Invoke($"[{timestamp}] SENT and FLUSHED: {hexString}");
-                Debug.WriteLine($"[{timestamp}] SENT and FLUSHED: {hexString}");
                 
                 return true;
             }
@@ -708,9 +623,12 @@ namespace TeBot
                                 // Create a new cancellation token if needed
                                 var cancellationToken = _transmissionCancellation?.Token ?? CancellationToken.None;
                                 
-                                // Method 1: Simple async read with timeout for HC-05
+                                // Use longer timeout when we might expect robot responses
+                                int readTimeout = _dataQueue.Count > 0 ? 3000 : READ_TIMEOUT_MS; // 3s if commands pending
+                                
+                                // Method 1: Simple async read with adaptive timeout for HC-05
                                 var readTask = _bluetoothStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
-                                var timeoutTask = Task.Delay(READ_TIMEOUT_MS, cancellationToken);
+                                var timeoutTask = Task.Delay(readTimeout, cancellationToken);
                                 
                                 var completedTask = await Task.WhenAny(readTask, timeoutTask);
                                 
@@ -719,13 +637,22 @@ namespace TeBot
                                     bytesRead = await readTask;
                                     if (bytesRead > 0)
                                     {
-                                        StatusChanged?.Invoke($"Successfully read {bytesRead} bytes");
+                                        StatusChanged?.Invoke($"📡 Successfully read {bytesRead} bytes from robot");
                                     }
+                                }
+                                else if (completedTask == timeoutTask)
+                                {
+                                    // Timeout occurred - log it for diagnosis
+                                    if (_dataQueue.Count > 0)
+                                    {
+                                        StatusChanged?.Invoke($"⏱️ Read timeout ({readTimeout}ms) - commands pending but no robot response");
+                                    }
+                                    // Don't log timeouts when no commands are pending (normal idle state)
                                 }
                                 else if (readTask.IsFaulted)
                                 {
                                     // Don't try sync read if async failed - just log and continue
-                                    StatusChanged?.Invoke($"Async read error: {readTask.Exception?.GetBaseException()?.Message}");
+                                    StatusChanged?.Invoke($"❌ Async read error: {readTask.Exception?.GetBaseException()?.Message}");
                                     if (_isConnected) // Only delay if still connected
                                     {
                                         await Task.Delay(1000, cancellationToken);
@@ -733,7 +660,7 @@ namespace TeBot
                                 }
                                 else if (readTask.IsCanceled)
                                 {
-                                    StatusChanged?.Invoke("Read operation cancelled");
+                                    StatusChanged?.Invoke("🚫 Read operation cancelled");
                                     break;
                                 }
                             }
@@ -759,32 +686,23 @@ namespace TeBot
                                 var timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
                                 var rawHex = BitConverter.ToString(buffer, 0, bytesRead).Replace("-", " ");
                                 Debug.WriteLine($"[{timestamp}] Robot data received ({bytesRead} bytes): {rawHex}");
-                                StatusChanged?.Invoke($"[{timestamp}] DATA RECEIVED: {bytesRead} bytes - {rawHex}");
+                                StatusChanged?.Invoke($"[{timestamp}] 🤖 ROBOT DATA: {bytesRead} bytes - {rawHex}");
                                 
                                 if (_isListenOnlyMode)
                                 {
-                                    // In listen-only mode, show everything
+                                    // In listen-only mode, show everything and stream all data
                                     StatusChanged?.Invoke($"LISTEN: Raw bytes: {rawHex}");
                                     StatusChanged?.Invoke($"LISTEN: Buffer now has {dataBuffer.Count} total bytes");
                                     
-                                    // Process as 8-byte packets if possible
-                                    int packetsProcessed = 0;
-                                    while (dataBuffer.Count >= DATA_PACKET_SIZE)
-                                    {
-                                        var packet = dataBuffer.Take(DATA_PACKET_SIZE).ToArray();
-                                        dataBuffer.RemoveRange(0, DATA_PACKET_SIZE);
-                                        packetsProcessed++;
-                                        
-                                        var packetHex = BitConverter.ToString(packet).Replace("-", " ");
-                                        StatusChanged?.Invoke($"LISTEN: Packet #{packetsProcessed}: {packetHex}");
-                                        DataReceived?.Invoke(packet);
-                                    }
-                                    
-                                    // Show any remaining bytes
+                                    // Send ALL data as byte stream (same as normal mode)
                                     if (dataBuffer.Count > 0)
                                     {
-                                        var remainingHex = BitConverter.ToString(dataBuffer.ToArray()).Replace("-", " ");
-                                        StatusChanged?.Invoke($"LISTEN: Remaining {dataBuffer.Count} bytes: {remainingHex}");
+                                        var allData = dataBuffer.ToArray();
+                                        dataBuffer.Clear();
+                                        
+                                        var streamHex = BitConverter.ToString(allData).Replace("-", " ");
+                                        StatusChanged?.Invoke($"LISTEN: Streaming {allData.Length} bytes: {streamHex}");
+                                        DataReceived?.Invoke(allData);
                                     }
                                 }
                                 else
@@ -795,10 +713,11 @@ namespace TeBot
                             }
                             else
                             {
-                                // No data received, log periodically (every 10 seconds)
-                                if (DateTime.Now.Second % 10 == 0 && DateTime.Now.Millisecond < 500)
+                                // No data received this cycle - only log periodically (every 30 seconds) to avoid spam
+                                if (DateTime.Now.Second % 30 == 0 && DateTime.Now.Millisecond < 500)
                                 {
-                                    StatusChanged?.Invoke($"Still listening... CanRead={_bluetoothStream.CanRead}, Stream type: {_bluetoothStream.GetType().Name}");
+                                    var queueInfo = _dataQueue.Count > 0 ? $" ({_dataQueue.Count} commands pending)" : "";
+                                    StatusChanged?.Invoke($"🔍 Still listening for robot responses{queueInfo}... CanRead={_bluetoothStream.CanRead}");
                                 }
                             }
                         }
@@ -853,123 +772,26 @@ namespace TeBot
         {
             try
             {
-                if (_isContinuousMode)
+                // PURE BYTE STREAMING: Send ALL received data to Scratch immediately
+                if (dataBuffer.Count > 0)
                 {
-                    // Continuous mode processing - look for 82-byte blocks
-                    while (dataBuffer.Count >= 82)
-                    {
-                        var fullResponse = dataBuffer.Take(82).ToArray();
-                        dataBuffer.RemoveRange(0, 82);
-                        
-                        // Parse the 82-byte response into marker + 10 packets
-                        var marker = fullResponse.Take(2).ToArray();
-                        var markerHex = BitConverter.ToString(marker).Replace("-", " ");
-                        
-                        StatusChanged?.Invoke($"=== CONTINUOUS MODE: 82-byte block received ===");
-                        StatusChanged?.Invoke($"Marker: {markerHex}");
-                        
-                        // Extract each 8-byte packet and add to queue
-                        for (int i = 0; i < 10; i++)
-                        {
-                            int packetStart = 2 + (i * 8); // Skip 2-byte marker
-                            if (packetStart + 8 <= fullResponse.Length)
-                            {
-                                var packet = new byte[8];
-                                Array.Copy(fullResponse, packetStart, packet, 0, 8);
-                                _receivedDataQueue.Enqueue(packet);
-                                
-                                var packetHex = BitConverter.ToString(packet).Replace("-", " ");
-                                StatusChanged?.Invoke($"  Packet {i + 1}: {packetHex}");
-                            }
-                        }
-                        
-                        // Signal that a complete 82-byte response is available (10 packets)
-                        // Only release if semaphore count is 0 to prevent accumulation
-                        if (_responseAvailableSemaphore.CurrentCount == 0)
-                        {
-                            _responseAvailableSemaphore.Release();
-                            Debug.WriteLine($"ProcessNormalModeData: Released semaphore for 82-byte response");
-                        }
-                        else
-                        {
-                            Debug.WriteLine($"ProcessNormalModeData: Semaphore already signaled (count: {_responseAvailableSemaphore.CurrentCount})");
-                        }
-                        
-                        StatusChanged?.Invoke($"=== END 82-byte block (queue: {_receivedDataQueue.Count} packets) ===");
-                        
-                        var responseHex = BitConverter.ToString(fullResponse, 0, Math.Min(16, fullResponse.Length)).Replace("-", " ");
-                        Debug.WriteLine($"Processed 82-byte continuous response: {responseHex}...");
-                        break; // Process one 82-byte block at a time
-                    }
+                    // Convert entire buffer to byte array and send to Scratch
+                    var allData = dataBuffer.ToArray();
+                    dataBuffer.Clear(); // Clear buffer after processing
                     
-                    // If we have some data but less than 82 bytes, show what we have
-                    if (dataBuffer.Count > 0 && dataBuffer.Count < 82)
-                    {
-                        var partialHex = BitConverter.ToString(dataBuffer.ToArray()).Replace("-", " ");
-                        StatusChanged?.Invoke($"Continuous: Partial data ({dataBuffer.Count} bytes): {partialHex}");
-                    }
-                }
-                else
-                {
-                    // Regular mode: Check for 82-byte slave responses first, then individual packets
-                    while (dataBuffer.Count >= 82)
-                    {
-                        var fullResponse = dataBuffer.Take(82).ToArray();
-                        dataBuffer.RemoveRange(0, 82);
-                        
-                        // Parse the 82-byte slave response into marker + 10 packets
-                        var marker = fullResponse.Take(2).ToArray();
-                        var markerHex = BitConverter.ToString(marker).Replace("-", " ");
-                        
-                        StatusChanged?.Invoke($"=== REGULAR MODE: 82-byte slave response received ===");
-                        StatusChanged?.Invoke($"Slave sent marker: {markerHex}");
-                        StatusChanged?.Invoke($"Parsing slave response as 10x8-byte packets:");
-                        
-                        // Extract each 8-byte packet from slave response
-                        for (int i = 0; i < 10; i++)
-                        {
-                            int packetStart = 2 + (i * 8); // Skip 2-byte marker
-                            if (packetStart + 8 <= fullResponse.Length)
-                            {
-                                var packet = new byte[8];
-                                Array.Copy(fullResponse, packetStart, packet, 0, 8);
-                                _receivedDataQueue.Enqueue(packet);
-                                
-                                var packetHex = BitConverter.ToString(packet).Replace("-", " ");
-                                StatusChanged?.Invoke($"  Slave packet {i + 1}: {packetHex}");
-                                Debug.WriteLine($"Regular mode slave packet {i + 1}/10: {packetHex}");
-                            }
-                        }
-                        
-                        StatusChanged?.Invoke($"=== END slave response (82 bytes) ===");
-                        break; // Process one 82-byte block at a time
-                    }
+                    // Add to received queue for legacy compatibility
+                    _receivedDataQueue.Enqueue(allData);
                     
-                    // If no complete 82-byte blocks, process individual 8-byte packets
-                    if (dataBuffer.Count >= DATA_PACKET_SIZE && dataBuffer.Count < 82)
-                    {
-                        while (dataBuffer.Count >= DATA_PACKET_SIZE)
-                        {
-                            var packet = dataBuffer.Take(DATA_PACKET_SIZE).ToArray();
-                            dataBuffer.RemoveRange(0, DATA_PACKET_SIZE);
-                            _receivedDataQueue.Enqueue(packet);
-                            
-                            var packetHex = BitConverter.ToString(packet).Replace("-", " ");
-                            StatusChanged?.Invoke($"Regular: Individual packet: {packetHex}");
-                        }
-                    }
+                    var dataHex = BitConverter.ToString(allData).Replace("-", " ");
+                    StatusChanged?.Invoke($"Streaming {allData.Length} bytes to Scratch: {dataHex}");
                     
-                    // Show any remaining partial data
-                    if (dataBuffer.Count > 0 && dataBuffer.Count < DATA_PACKET_SIZE)
-                    {
-                        var partialHex = BitConverter.ToString(dataBuffer.ToArray()).Replace("-", " ");
-                        StatusChanged?.Invoke($"Regular: Partial data ({dataBuffer.Count} bytes): {partialHex}");
-                    }
+                    // Fire event to Form1 with complete byte stream
+                    DataReceived?.Invoke(allData);
                 }
             }
             catch (Exception ex)
             {
-                StatusChanged?.Invoke($"Error processing normal mode data: {ex.Message}");
+                StatusChanged?.Invoke($"Error processing byte stream: {ex.Message}");
             }
         }
 

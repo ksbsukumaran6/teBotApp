@@ -53,13 +53,8 @@ namespace TeBot
             this.lblPairingPin = new System.Windows.Forms.Label();
             this.btnConnect = new System.Windows.Forms.Button();
             this.btnDisconnect = new System.Windows.Forms.Button();
-            this.controlsGroupBox = new System.Windows.Forms.GroupBox();
-            this.controlsTableLayout = new System.Windows.Forms.TableLayoutPanel();
-            this.btnTestMultipleArrays = new System.Windows.Forms.Button();
-            this.btnStartContinuous = new System.Windows.Forms.Button();
-            this.btnStopContinuous = new System.Windows.Forms.Button();
-            this.btnStartListen = new System.Windows.Forms.Button();
-            this.btnStopListen = new System.Windows.Forms.Button();
+
+
             this.statusGroupBox = new System.Windows.Forms.GroupBox();
             this.txtStatus = new System.Windows.Forms.TextBox();
             this.mainTableLayoutPanel.SuspendLayout();
@@ -68,8 +63,6 @@ namespace TeBot
             this.webSocketTableLayout.SuspendLayout();
             this.bluetoothGroupBox.SuspendLayout();
             this.bluetoothTableLayout.SuspendLayout();
-            this.controlsGroupBox.SuspendLayout();
-            this.controlsTableLayout.SuspendLayout();
             this.statusGroupBox.SuspendLayout();
             this.SuspendLayout();
             // 
@@ -80,18 +73,16 @@ namespace TeBot
             this.mainTableLayoutPanel.Controls.Add(this.headerPanel, 0, 0);
             this.mainTableLayoutPanel.Controls.Add(this.webSocketGroupBox, 0, 1);
             this.mainTableLayoutPanel.Controls.Add(this.bluetoothGroupBox, 0, 2);
-            this.mainTableLayoutPanel.Controls.Add(this.controlsGroupBox, 0, 3);
-            this.mainTableLayoutPanel.Controls.Add(this.statusGroupBox, 0, 4);
+            this.mainTableLayoutPanel.Controls.Add(this.statusGroupBox, 0, 3);
             this.mainTableLayoutPanel.Dock = System.Windows.Forms.DockStyle.Fill;
             this.mainTableLayoutPanel.Location = new System.Drawing.Point(0, 0);
             this.mainTableLayoutPanel.Margin = new System.Windows.Forms.Padding(8);
             this.mainTableLayoutPanel.Name = "mainTableLayoutPanel";
             this.mainTableLayoutPanel.Padding = new System.Windows.Forms.Padding(8);
-            this.mainTableLayoutPanel.RowCount = 5;
+            this.mainTableLayoutPanel.RowCount = 4;
             this.mainTableLayoutPanel.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Absolute, 60F));
             this.mainTableLayoutPanel.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Absolute, 80F));
             this.mainTableLayoutPanel.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Absolute, 240F));
-            this.mainTableLayoutPanel.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Absolute, 120F));
             this.mainTableLayoutPanel.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 100F));
             this.mainTableLayoutPanel.Size = new System.Drawing.Size(1000, 700);
             this.mainTableLayoutPanel.TabIndex = 0;
@@ -397,113 +388,16 @@ namespace TeBot
             // 
             // controlsGroupBox
             // 
-            this.controlsGroupBox.Controls.Add(this.controlsTableLayout);
-            this.controlsGroupBox.Dock = System.Windows.Forms.DockStyle.Fill;
-            this.controlsGroupBox.Font = new System.Drawing.Font("Segoe UI", 10F, System.Drawing.FontStyle.Bold);
-            this.controlsGroupBox.Location = new System.Drawing.Point(11, 391);
-            this.controlsGroupBox.Name = "controlsGroupBox";
-            this.controlsGroupBox.Padding = new System.Windows.Forms.Padding(8);
-            this.controlsGroupBox.Size = new System.Drawing.Size(978, 114);
-            this.controlsGroupBox.TabIndex = 3;
-            this.controlsGroupBox.TabStop = false;
-            this.controlsGroupBox.Text = "🎮 Robot Control Tests";
-            // 
-            // controlsTableLayout
-            // 
-            this.controlsTableLayout.ColumnCount = 5;
-            this.controlsTableLayout.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle(System.Windows.Forms.SizeType.Percent, 20F));
-            this.controlsTableLayout.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle(System.Windows.Forms.SizeType.Percent, 20F));
-            this.controlsTableLayout.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle(System.Windows.Forms.SizeType.Percent, 20F));
-            this.controlsTableLayout.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle(System.Windows.Forms.SizeType.Percent, 20F));
-            this.controlsTableLayout.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle(System.Windows.Forms.SizeType.Percent, 20F));
-            this.controlsTableLayout.Controls.Add(this.btnTestMultipleArrays, 0, 0);
-            this.controlsTableLayout.Controls.Add(this.btnStartContinuous, 1, 0);
-            this.controlsTableLayout.Controls.Add(this.btnStopContinuous, 2, 0);
-            this.controlsTableLayout.Controls.Add(this.btnStartListen, 3, 0);
-            this.controlsTableLayout.Controls.Add(this.btnStopListen, 4, 0);
-            this.controlsTableLayout.Dock = System.Windows.Forms.DockStyle.Fill;
-            this.controlsTableLayout.Location = new System.Drawing.Point(8, 26);
-            this.controlsTableLayout.Name = "controlsTableLayout";
-            this.controlsTableLayout.RowCount = 1;
-            this.controlsTableLayout.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 100F));
-            this.controlsTableLayout.Size = new System.Drawing.Size(962, 80);
-            this.controlsTableLayout.TabIndex = 0;
-            // 
-            // btnTestMultipleArrays
-            // 
-            this.btnTestMultipleArrays.Dock = System.Windows.Forms.DockStyle.Fill;
-            this.btnTestMultipleArrays.Enabled = false;
-            this.btnTestMultipleArrays.Font = new System.Drawing.Font("Segoe UI", 9F);
-            this.btnTestMultipleArrays.Location = new System.Drawing.Point(3, 3);
-            this.btnTestMultipleArrays.Name = "btnTestMultipleArrays";
-            this.btnTestMultipleArrays.Size = new System.Drawing.Size(186, 74);
-            this.btnTestMultipleArrays.TabIndex = 0;
-            this.btnTestMultipleArrays.Text = "🧪 Test Multiple Arrays";
-            this.btnTestMultipleArrays.UseVisualStyleBackColor = true;
-            this.btnTestMultipleArrays.Click += new System.EventHandler(this.btnTestMultipleArrays_Click);
-            // 
-            // btnStartContinuous
-            // 
-            this.btnStartContinuous.Dock = System.Windows.Forms.DockStyle.Fill;
-            this.btnStartContinuous.Enabled = false;
-            this.btnStartContinuous.Font = new System.Drawing.Font("Segoe UI", 9F);
-            this.btnStartContinuous.Location = new System.Drawing.Point(195, 3);
-            this.btnStartContinuous.Name = "btnStartContinuous";
-            this.btnStartContinuous.Size = new System.Drawing.Size(186, 74);
-            this.btnStartContinuous.TabIndex = 1;
-            this.btnStartContinuous.Text = "🔄 Start Continuous";
-            this.btnStartContinuous.UseVisualStyleBackColor = true;
-            this.btnStartContinuous.Click += new System.EventHandler(this.btnStartContinuous_Click);
-            // 
-            // btnStopContinuous
-            // 
-            this.btnStopContinuous.Dock = System.Windows.Forms.DockStyle.Fill;
-            this.btnStopContinuous.Enabled = false;
-            this.btnStopContinuous.Font = new System.Drawing.Font("Segoe UI", 9F);
-            this.btnStopContinuous.Location = new System.Drawing.Point(387, 3);
-            this.btnStopContinuous.Name = "btnStopContinuous";
-            this.btnStopContinuous.Size = new System.Drawing.Size(186, 74);
-            this.btnStopContinuous.TabIndex = 2;
-            this.btnStopContinuous.Text = "⏹️ Stop Continuous";
-            this.btnStopContinuous.UseVisualStyleBackColor = true;
-            this.btnStopContinuous.Click += new System.EventHandler(this.btnStopContinuous_Click);
-            // 
-            // btnStartListen
-            // 
-            this.btnStartListen.Dock = System.Windows.Forms.DockStyle.Fill;
-            this.btnStartListen.Enabled = false;
-            this.btnStartListen.Font = new System.Drawing.Font("Segoe UI", 9F);
-            this.btnStartListen.Location = new System.Drawing.Point(579, 3);
-            this.btnStartListen.Name = "btnStartListen";
-            this.btnStartListen.Size = new System.Drawing.Size(186, 74);
-            this.btnStartListen.TabIndex = 3;
-            this.btnStartListen.Text = "👂 Start Listen Only";
-            this.btnStartListen.UseVisualStyleBackColor = true;
-            this.btnStartListen.Click += new System.EventHandler(this.btnStartListen_Click);
-            // 
-            // btnStopListen
-            // 
-            this.btnStopListen.Dock = System.Windows.Forms.DockStyle.Fill;
-            this.btnStopListen.Enabled = false;
-            this.btnStopListen.Font = new System.Drawing.Font("Segoe UI", 9F);
-            this.btnStopListen.Location = new System.Drawing.Point(771, 3);
-            this.btnStopListen.Name = "btnStopListen";
-            this.btnStopListen.Size = new System.Drawing.Size(188, 74);
-            this.btnStopListen.TabIndex = 4;
-            this.btnStopListen.Text = "🔇 Stop Listen";
-            this.btnStopListen.UseVisualStyleBackColor = true;
-            this.btnStopListen.Click += new System.EventHandler(this.btnStopListen_Click);
-            // 
             // statusGroupBox
             // 
             this.statusGroupBox.Controls.Add(this.txtStatus);
             this.statusGroupBox.Dock = System.Windows.Forms.DockStyle.Fill;
             this.statusGroupBox.Font = new System.Drawing.Font("Segoe UI", 10F, System.Drawing.FontStyle.Bold);
-            this.statusGroupBox.Location = new System.Drawing.Point(11, 511);
+            this.statusGroupBox.Location = new System.Drawing.Point(11, 391);
             this.statusGroupBox.Name = "statusGroupBox";
             this.statusGroupBox.Padding = new System.Windows.Forms.Padding(8);
-            this.statusGroupBox.Size = new System.Drawing.Size(978, 178);
-            this.statusGroupBox.TabIndex = 4;
+            this.statusGroupBox.Size = new System.Drawing.Size(978, 298);
+            this.statusGroupBox.TabIndex = 3;
             this.statusGroupBox.TabStop = false;
             this.statusGroupBox.Text = "📊 Status Log";
             // 
@@ -518,7 +412,7 @@ namespace TeBot
             this.txtStatus.Name = "txtStatus";
             this.txtStatus.ReadOnly = true;
             this.txtStatus.ScrollBars = System.Windows.Forms.ScrollBars.Vertical;
-            this.txtStatus.Size = new System.Drawing.Size(962, 144);
+            this.txtStatus.Size = new System.Drawing.Size(962, 264);
             this.txtStatus.TabIndex = 0;
             // 
             // Form1
@@ -534,7 +428,6 @@ namespace TeBot
             this.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen;
             this.Text = "TeBot - WebSocket to Bluetooth Bridge";
             this.FormClosing += new System.Windows.Forms.FormClosingEventHandler(this.Form1_FormClosing);
-            this.Load += new System.EventHandler(this.Form1_Load);
             this.mainTableLayoutPanel.ResumeLayout(false);
             this.headerPanel.ResumeLayout(false);
             this.headerPanel.PerformLayout();
@@ -544,8 +437,6 @@ namespace TeBot
             this.bluetoothGroupBox.ResumeLayout(false);
             this.bluetoothTableLayout.ResumeLayout(false);
             this.bluetoothTableLayout.PerformLayout();
-            this.controlsGroupBox.ResumeLayout(false);
-            this.controlsTableLayout.ResumeLayout(false);
             this.statusGroupBox.ResumeLayout(false);
             this.statusGroupBox.PerformLayout();
             this.ResumeLayout(false);
@@ -559,7 +450,6 @@ namespace TeBot
         private System.Windows.Forms.Panel headerPanel;
         private System.Windows.Forms.GroupBox webSocketGroupBox;
         private System.Windows.Forms.GroupBox bluetoothGroupBox;
-        private System.Windows.Forms.GroupBox controlsGroupBox;
         private System.Windows.Forms.GroupBox statusGroupBox;
 
         // Header Controls
@@ -587,14 +477,6 @@ namespace TeBot
         private System.Windows.Forms.TextBox txtPairingPin;
         private System.Windows.Forms.Button btnConnect;
         private System.Windows.Forms.Button btnDisconnect;
-
-        // Control Test Buttons
-        private System.Windows.Forms.TableLayoutPanel controlsTableLayout;
-        private System.Windows.Forms.Button btnTestMultipleArrays;
-        private System.Windows.Forms.Button btnStartContinuous;
-        private System.Windows.Forms.Button btnStopContinuous;
-        private System.Windows.Forms.Button btnStartListen;
-        private System.Windows.Forms.Button btnStopListen;
 
         // Status Controls
         private System.Windows.Forms.TextBox txtStatus;

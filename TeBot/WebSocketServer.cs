@@ -189,17 +189,22 @@ namespace TeBot
                 var service = _server.WebSocketServices["/"];
                 if (service?.Sessions?.Count > 0)
                 {
+                    Debug.WriteLine($"Attempting to send {data.Length} bytes to {service.Sessions.Count} connected clients");
+                    
+                    // Send as binary data only (removed confusing text message)
                     service.Sessions.Broadcast(data);
-                    Debug.WriteLine($"Sent {data.Length} bytes to {service.Sessions.Count} connected clients");
+                    
+                    var hexString = BitConverter.ToString(data).Replace("-", " ");
+                    Debug.WriteLine($"✅ Sent {data.Length} bytes as binary to {service.Sessions.Count} clients: {hexString}");
                 }
                 else
                 {
-                    Debug.WriteLine("No connected clients to send data to");
+                    Debug.WriteLine("❌ No connected clients to send data to");
                 }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error sending data to clients: {ex.Message}");
+                Debug.WriteLine($"❌ Error sending data to clients: {ex.Message}");
             }
             
             return Task.CompletedTask;

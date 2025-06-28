@@ -17,14 +17,14 @@ namespace TeBot
         private WebSocketDataServer _webSocketServer;
         private BluetoothManager _bluetoothManager;
         private int _dataPacketsSent = 0;
-        private int _continuousResponseCount = 0;
-        private volatile bool _isProcessingCommand = false;
 
         public Form1()
         {
             InitializeComponent();
             InitializeComponents();
-        }        private void InitializeComponents()
+        }
+
+        private void InitializeComponents()
         {
             // Initialize WebSocket server
             _webSocketServer = new WebSocketDataServer();
@@ -32,13 +32,13 @@ namespace TeBot
             
             // Subscribe to WebSocket connection events
             DataReceiver.SessionConnected += OnScratchConnected;
-            DataReceiver.SessionDisconnected += OnScratchDisconnected;            // Initialize Bluetooth manager
+            DataReceiver.SessionDisconnected += OnScratchDisconnected;
+            
+            // Initialize Bluetooth manager
             _bluetoothManager = new BluetoothManager();
             _bluetoothManager.StatusChanged += OnBluetoothStatusChanged;
             _bluetoothManager.DevicesDiscovered += OnDevicesDiscovered;
-            _bluetoothManager.QueueStatus += OnQueueStatusChanged;
-            _bluetoothManager.TransmissionStatus += OnTransmissionStatusChanged;
-            _bluetoothManager.ContinuousResponseReceived += OnContinuousResponseReceived;
+            _bluetoothManager.DataReceived += OnRobotDataReceived; // Forward robot data to Scratch
             _bluetoothManager.BluetoothAdaptersDiscovered += OnBluetoothAdaptersDiscovered;
 
             // Initialize adapter UI
@@ -48,302 +48,64 @@ namespace TeBot
             
             // Show initial adapter selection
             UpdateAdapterSelectionUI();
-        
         }
 
-        private void OnQueueStatusChanged(int queueCount)
-        {
-            UpdateStatus($"Queue status: {queueCount} packets waiting");
-        }
-
-        private void OnTransmissionStatusChanged(bool isTransmitting)
-        {
-            UpdateStatus($"Transmission: {(isTransmitting ? "Active" : "Idle")}");
-        }        private async void OnDataReceived(byte[] data)
+        private async void OnDataReceived(byte[] data)
         {
             try
             {
                 if (_bluetoothManager.IsConnected)
                 {
-                    UpdateStatus($"📨 Received {data.Length} bytes from Scratch - processing...");
+                    // Log what we received from Scratch
+                    var scratchHex = BitConverter.ToString(data).Replace("-", " ");
+                    UpdateStatus($"📨 Received {data.Length} bytes from Scratch: {scratchHex}");
                     
-                    // Support multiple data formats
-                    if (data.Length == 8)
+                    // Remove leading zero if present (fix the extra 00 byte issue)
+                    byte[] cleanData = data;
+                    if (data.Length > 0 && data[0] == 0x00)
                     {
-                        // New 8-byte command format
-                        await ProcessScratch8ByteCommand(data);
+                        cleanData = new byte[data.Length - 1];
+                        Array.Copy(data, 1, cleanData, 0, data.Length - 1);
+                        var cleanHex = BitConverter.ToString(cleanData).Replace("-", " ");
+                        UpdateStatus($"🔧 Removed leading zero. Sending: {cleanHex}");
                     }
-                    else if (data.Length == 80 && data[0] == 0xAA && data[1] == 0x55)
-                    {
-                        // 80-byte packet with headers
-                        await ProcessScratch80ByteProtocol(data);
-                    }
-                    else if (data.Length == 80)
-                    {
-                        // Legacy 80-byte format without headers
-                        await ProcessScratchCommand80Bytes(data);
-                    }
-                    else if (data.Length > 80 && IsJsonData(data))
-                    {
-                        // JSON format
-                        await ProcessScratchCommandJson(data);
-                    }
-                    else
-                    {
-                        UpdateStatus($"❌ Invalid data format from Scratch. Expected 8 or 80 bytes, or JSON. Received: {data.Length} bytes");
-                        await SendResponseToScratch(new List<byte[]>(), false, "Invalid data format");
-                    }
-                }
-                else
-                {
-                    UpdateStatus("❌ Received Scratch command but robot not connected");
-                    await SendResponseToScratch(new List<byte[]>(), false, "Robot not connected");
-                }
-            }
-            catch (Exception ex)
-            {
-                UpdateStatus($"❌ Error processing Scratch data: {ex.Message}");
-                await SendResponseToScratch(new List<byte[]>(), false, $"Processing error: {ex.Message}");
-            }
-        }
-
-        private async Task ProcessScratch8ByteCommand(byte[] data)
-        {
-            // Prevent overlapping command processing to avoid buffer corruption
-            if (_isProcessingCommand)
-            {
-                UpdateStatus($"⚠️ Dropping command - already processing another command (prevents buffer corruption)");
-                await SendRawResponseToScratch(new byte[8]); // Send zeros for dropped command
-                return;
-            }
-
-            _isProcessingCommand = true;
-            try
-            {
-                UpdateStatus($"🔄 Processing 8-byte command from Scratch...");
-                
-                // Validate 8-byte command
-                if (data.Length != 8)
-                {
-                    throw new ArgumentException($"Expected 8 bytes, received {data.Length} bytes");
-                }
-                
-                // Log the exact command being sent (no offset, no shifting)
-                var hexString = BitConverter.ToString(data).Replace("-", " ");
-                UpdateStatus($"📋 Sending exact 8 bytes to robot: {hexString}");
-                
-                // Send the EXACT same 8 bytes to robot immediately (no modifications)
-                bool success = await _bluetoothManager.SendDataImmediately(data);
-                
-                if (success)
-                {
-                    UpdateStatus($"✅ Command sent to robot successfully");
                     
-                    // Wait for robot to respond with 8 bytes
-                    var responses = await WaitForResponsesWithTimeout(1, 1000);
+                    // Send command to robot
+                    bool success = await _bluetoothManager.SendDataImmediately(cleanData);
                     
-                    if (responses.Count > 0)
+                    if (success)
                     {
-                        var robotResponse = responses[0];
-                        var robotHex = BitConverter.ToString(robotResponse).Replace("-", " ");
-                        UpdateStatus($"🤖 Robot responded: {robotHex}");
+                        UpdateStatus($"✅ Command sent to robot successfully");
                         
-                        // Send the robot's response back to Scratch
-                        await SendRawResponseToScratch(robotResponse);
-                        
-                        UpdateStatus($"📤 Sent robot response back to Scratch");
+                        // IMPORTANT: Add delay to give robot time to process before next command
+                        await Task.Delay(100); // 100ms delay between commands
                     }
                     else
                     {
-                        UpdateStatus($"⚠️ No response from robot within timeout");
-                        await SendRawResponseToScratch(new byte[8]); // Send 8 zeros for no response
+                        UpdateStatus($"❌ Failed to forward data to robot");
                     }
                 }
                 else
                 {
-                    UpdateStatus($"❌ Failed to send command to robot");
-                    await SendRawResponseToScratch(new byte[8]); // Send 8 zeros for send failure
+                    UpdateStatus("❌ Received Scratch data but robot not connected");
                 }
             }
             catch (Exception ex)
             {
-                UpdateStatus($"❌ Error processing 8-byte command: {ex.Message}");
-                await SendRawResponseToScratch(new byte[8]); // Send 8 zeros for error
-            }
-            finally
-            {
-                _isProcessingCommand = false;
-            }
-        }
-        
-        private byte[] CreatePaddedResponse(byte[] robotResponse)
-        {
-            // Create 80-byte response by repeating the 8-byte robot response 10 times
-            var paddedResponse = new byte[80];
-            for (int i = 0; i < 10; i++)
-            {
-                Array.Copy(robotResponse, 0, paddedResponse, i * 8, Math.Min(8, robotResponse.Length));
-            }
-            return paddedResponse;
-        }
-
-        private async Task ProcessScratchCommand80Bytes(byte[] data)
-        {
-            try
-            {
-                // Split 80 bytes into 10 packets of 8 bytes each
-                var packets = new byte[10][];
-                for (int i = 0; i < 10; i++)
-                {
-                    packets[i] = new byte[8];
-                    Array.Copy(data, i * 8, packets[i], 0, 8);
-                }
-
-                UpdateStatus($"🔄 Sending 10 packets (80 bytes) to robot...");
-                
-                // Send to robot and wait for response
-                bool success = await _bluetoothManager.SendDataArrayAsync(packets);
-                
-                if (success)
-                {
-                    // Wait for robot response (10 packets back)
-                    var responses = await WaitForResponsesWithTimeout(10, 2000);
-                    
-                    UpdateStatus($"✅ Robot responded: {responses.Count}/10 packets received");
-                    
-                    // Send response back to Scratch
-                    await SendResponseToScratch(responses, true, "Success");
-                    
-                    // Update counters
-                    Interlocked.Increment(ref _dataPacketsSent);
-                    BeginInvoke(new Action(() =>
-                    {
-                        lblDataCount.Text = $"Scratch commands processed: {_dataPacketsSent}";
-                    }));
-                }
-                else
-                {
-                    UpdateStatus("❌ Failed to send data to robot");
-                    await SendResponseToScratch(new List<byte[]>(), false, "Robot send failed");
-                }
-            }
-            catch (Exception ex)
-            {
-                UpdateStatus($"❌ Error in 80-byte processing: {ex.Message}");
-                await SendResponseToScratch(new List<byte[]>(), false, $"80-byte processing error: {ex.Message}");
+                UpdateStatus($"❌ Error forwarding Scratch data: {ex.Message}");
             }
         }
 
-        private async Task ProcessScratchCommandJson(byte[] data)
+        private void OnScratchConnected(string sessionId)
         {
-            try
-            {
-                string jsonString = Encoding.UTF8.GetString(data);
-                UpdateStatus($"📋 Processing JSON command from Scratch...");
-                
-                // Simple JSON parsing (you can use System.Text.Json for more robust parsing)
-                if (jsonString.Contains("\"command\":\"send_data\"") && jsonString.Contains("\"data\":["))
-                {
-                    // Extract data array from JSON (simplified parsing)
-                    var dataStart = jsonString.IndexOf("\"data\":[") + 8;
-                    var dataEnd = jsonString.IndexOf("]", dataStart);
-                    var dataArrayStr = jsonString.Substring(dataStart, dataEnd - dataStart);
-                    
-                    var byteValues = dataArrayStr.Split(',').Select(s => byte.Parse(s.Trim())).ToArray();
-                    
-                    if (byteValues.Length == 80)
-                    {
-                        await ProcessScratchCommand80Bytes(byteValues);
-                    }
-                    else
-                    {
-                        UpdateStatus($"❌ JSON data array must be exactly 80 bytes. Received: {byteValues.Length}");
-                        await SendResponseToScratch(new List<byte[]>(), false, $"Invalid data size: {byteValues.Length}");
-                    }
-                }
-                else
-                {
-                    UpdateStatus("❌ Invalid JSON format from Scratch");
-                    await SendResponseToScratch(new List<byte[]>(), false, "Invalid JSON format");
-                }
-            }
-            catch (Exception ex)
-            {
-                UpdateStatus($"❌ Error parsing JSON: {ex.Message}");
-                await SendResponseToScratch(new List<byte[]>(), false, $"JSON parsing error: {ex.Message}");
-            }
+            UpdateStatus($"🌟 Scratch connected (Session: {sessionId})");
+            UpdateStatus($"   WebSocket server can now send data to Scratch");
         }
 
-        private bool IsJsonData(byte[] data)
+        private void OnScratchDisconnected(string sessionId)
         {
-            try
-            {
-                string text = Encoding.UTF8.GetString(data);
-                return text.TrimStart().StartsWith("{") && text.TrimEnd().EndsWith("}");
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private async Task SendResponseToScratch(List<byte[]> robotResponses, bool success, string message)
-        {
-            try
-            {
-                byte[] responseData;
-                
-                if (robotResponses.Count > 0)
-                {
-                    // Convert responses back to 80-byte format
-                    responseData = new byte[80];
-                    for (int i = 0; i < Math.Min(robotResponses.Count, 10); i++)
-                    {
-                        Array.Copy(robotResponses[i], 0, responseData, i * 8, Math.Min(robotResponses[i].Length, 8));
-                    }
-                    
-                    UpdateStatus($"📤 Sending 80 bytes back to Scratch (from {robotResponses.Count} robot packets)");
-                }
-                else
-                {
-                    // Send zeros if no response
-                    responseData = new byte[80];
-                    UpdateStatus($"📤 Sending empty response to Scratch: {message}");
-                }
-                
-                // Send response back through WebSocket
-                await _webSocketServer.SendToAllClientsAsync(responseData);
-                
-                UpdateStatus($"✅ Response sent to Scratch: Success={success}, {message}");
-            }
-            catch (Exception ex)
-            {
-                UpdateStatus($"❌ Error sending response to Scratch: {ex.Message}");
-            }
-        }
-
-        private async Task SendRawResponseToScratch(byte[] responseData)
-        {
-            try
-            {
-                // Ensure we have exactly 8 bytes
-                byte[] rawResponse = new byte[8];
-                if (responseData != null && responseData.Length > 0)
-                {
-                    Array.Copy(responseData, 0, rawResponse, 0, Math.Min(responseData.Length, 8));
-                }
-                
-                UpdateStatus($"📤 Sending raw 8-byte response to Scratch");
-                
-                // Send the raw 8-byte response directly through WebSocket
-                await _webSocketServer.SendToAllClientsAsync(rawResponse);
-                
-                UpdateStatus($"✅ Raw 8-byte response sent to Scratch");
-            }
-            catch (Exception ex)
-            {
-                UpdateStatus($"❌ Error sending raw response to Scratch: {ex.Message}");
-            }
+            UpdateStatus($"❌ Scratch disconnected (Session: {sessionId})");
+            UpdateStatus($"   Robot data will not reach Scratch until reconnected");
         }
 
         private void OnBluetoothStatusChanged(string status)
@@ -381,33 +143,6 @@ namespace TeBot
                 
                 btnConnect.Enabled = !isConnected && hasSelectedDevice && isPairedDevice;
                 btnDisconnect.Enabled = isConnected;
-                
-                // Test button
-                btnTestMultipleArrays.Enabled = isConnected && !_bluetoothManager.IsContinuousMode && !_bluetoothManager.IsListenOnlyMode;
-
-                // Continuous mode buttons
-                if (isConnected)
-                {
-                    btnStartContinuous.Enabled = !_bluetoothManager.IsContinuousMode && !_bluetoothManager.IsListenOnlyMode;
-                    btnStopContinuous.Enabled = _bluetoothManager.IsContinuousMode;
-                }
-                else
-                {
-                    btnStartContinuous.Enabled = false;
-                    btnStopContinuous.Enabled = false;
-                }
-
-                // Listen-only mode buttons
-                if (isConnected)
-                {
-                    btnStartListen.Enabled = !_bluetoothManager.IsListenOnlyMode && !_bluetoothManager.IsContinuousMode;
-                    btnStopListen.Enabled = _bluetoothManager.IsListenOnlyMode;
-                }
-                else
-                {
-                    btnStartListen.Enabled = false;
-                    btnStopListen.Enabled = false;
-                }
             }
             catch (Exception ex)
             {
@@ -540,23 +275,20 @@ namespace TeBot
             {
                 // Disable buttons during connection attempt
                 btnConnect.Enabled = false;
-                SetTestButtonEnabled(false);
                 
                 bool success = await _bluetoothManager.ConnectToDeviceAsync(selectedDevice);
                 if (success)
                 {
-                    // Connection successful - enable disconnect and test buttons
+                    // Connection successful - enable disconnect button
                     btnConnect.Enabled = false;
                     btnDisconnect.Enabled = true;
-                    SetTestButtonEnabled(true);
-                    UpdateStatus("Connected! You can now test multiple array transmission.");
+                    UpdateStatus("Connected! Ready for Scratch commands.");
                 }
                 else
                 {
                     // Connection failed - re-enable connect button
                     btnConnect.Enabled = true;
                     btnDisconnect.Enabled = false;
-                    SetTestButtonEnabled(false);
                 }
             }
             catch (Exception ex)
@@ -565,13 +297,10 @@ namespace TeBot
                 // Error occurred - re-enable connect button
                 btnConnect.Enabled = true;
                 btnDisconnect.Enabled = false;
-                SetTestButtonEnabled(false);
             }
-        }        private void SetTestButtonEnabled(bool enabled)
-        {
-            // Use the new comprehensive button state method instead
-            UpdateButtonStates(_bluetoothManager?.IsConnected ?? false);
-        }        private async void btnDisconnect_Click(object sender, EventArgs e)
+        }
+
+        private async void btnDisconnect_Click(object sender, EventArgs e)
         {
             try
             {
@@ -674,266 +403,14 @@ namespace TeBot
                 // Ensure buttons are in correct state even if error occurred
                 UpdateButtonStates(false);
             }
-        }        private void cmbDevices_SelectedIndexChanged(object sender, EventArgs e)
+        }
+
+        private void cmbDevices_SelectedIndexChanged(object sender, EventArgs e)
         {
             UpdateDeviceSelectionUI();
             UpdateButtonStates(_bluetoothManager?.IsConnected ?? false);
-        }private async void btnTestMultipleArrays_Click(object sender, EventArgs e)
-        {
-            if (!_bluetoothManager.IsConnected)
-            {
-                UpdateStatus("Cannot test: Not connected to Bluetooth device");
-                return;
-            }            try
-            {
-                UpdateStatus("Starting multiple arrays test: 10 lists of 8 bytes each...");
-
-                // Create one array with 10 packets of 8 bytes each (send all at once)
-                var allPackets = new byte[10][];
-                
-                for (int packetIndex = 0; packetIndex < 10; packetIndex++)
-                {
-                    var packet = new byte[8];
-                    packet[0] = 0x07; // Command identifier
-                    packet[1] = (byte)(packetIndex + 1); // Packet number (1-10)
-                    packet[2] = 0xFF; // Test marker
-                    packet[3] = 0xAA; // Test marker
-                    packet[4] = (byte)(packetIndex * 10); // Sequence number
-                    packet[5] = 0x55; // Test marker
-                    packet[6] = 0xBB; // Test marker
-                    packet[7] = (byte)(255 - (packetIndex * 10)); // Checksum-like value
-                    
-                    allPackets[packetIndex] = packet;
-                }
-
-                UpdateStatus($"Created 10 packets of 8 bytes each - sending all in one shot");
-
-                // Send all 10 packets at once with 150ms intervals between them
-                bool sendSuccess = await _bluetoothManager.SendDataArrayAsync(allPackets);
-                  if (sendSuccess)
-                {
-                    UpdateStatus("All 10 packets queued for transmission with 150ms intervals");
-                    
-                    // Wait for all 10 responses with 100ms timeout per response (total 1000ms)
-                    var responses = await WaitForResponsesWithTimeout(10, 1000);
-                    
-                    UpdateStatus($"Test completed! Sent 10 packets, received {responses.Count} responses");                    // Display all responses as a formatted list
-                    if (responses.Count > 0)
-                    {
-                        UpdateStatus("=== RECEIVED RESPONSE LIST ===");
-                        UpdateStatus($"Total responses: {responses.Count}/10");
-                        
-                        // Show all responses in a compact format
-                        for (int i = 0; i < responses.Count; i++)
-                        {
-                            var hexString = BitConverter.ToString(responses[i]).Replace("-", " ");
-                            UpdateStatus($"[{i + 1:D2}] {hexString}");
-                        }
-                        
-                        UpdateStatus("=== END OF LIST ===");
-                    }
-                    else
-                    {
-                        UpdateStatus("No responses received (timeout or connection issue)");
-                    }
-                    
-                    if (responses.Count < 10)
-                    {
-                        UpdateStatus($"Missing {10 - responses.Count} responses");
-                    }
-                }
-                else
-                {
-                    UpdateStatus("Failed to send packet array");
-                }
-
-                UpdateStatus($"Success rate: {(sendSuccess ? "Sent successfully" : "Send failed")}");
-            }
-            catch (Exception ex)
-            {
-                UpdateStatus($"Error in multiple arrays test: {ex.Message}");
-            }
-        }        /// <summary>
-        /// Wait for a specific number of responses with a timeout
-        /// Uses BluetoothManager's received data queue for actual responses
-        /// </summary>
-        private async Task<List<byte[]>> WaitForResponsesWithTimeout(int expectedCount, int timeoutMs)
-        {
-            var responses = new List<byte[]>();
-            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-            
-            UpdateStatus($"Waiting for {expectedCount} responses (timeout: {timeoutMs}ms)");
-              while (responses.Count < expectedCount && stopwatch.ElapsedMilliseconds < timeoutMs)
-            {
-                // Try to get received data from BluetoothManager
-                if (_bluetoothManager.TryGetReceivedData(out byte[] receivedData))
-                {
-                    responses.Add(receivedData);
-                    
-                    // Only show progress for every 5th response or at milestones
-                    if (responses.Count % 5 == 0 || responses.Count == expectedCount)
-                    {
-                        UpdateStatus($"  Progress: {responses.Count}/{expectedCount} responses received");
-                    }
-                }
-                else
-                {
-                    await Task.Delay(10); // Small delay to prevent tight loop
-                }
-            }
-            
-            if (responses.Count < expectedCount)
-            {
-                UpdateStatus($"Timeout: Only received {responses.Count}/{expectedCount} responses in {stopwatch.ElapsedMilliseconds}ms");
-            }
-            else
-            {
-                UpdateStatus($"Successfully received all {responses.Count} responses in {stopwatch.ElapsedMilliseconds}ms");
-            }
-            
-            return responses;        }
-
-        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
-        {
-            try
-            {
-                // Use force disconnect to avoid hanging during app exit
-                if (_bluetoothManager?.IsConnected == true)
-                {
-                    _bluetoothManager.ForceDisconnect();
-                }
-                
-                _webSocketServer?.Dispose();
-                _bluetoothManager?.Dispose();
-            }
-            catch (Exception ex)
-            {
-                // Don't prevent closing even if cleanup fails
-                System.Diagnostics.Debug.WriteLine($"Error during form closing: {ex.Message}");
-            }
         }
 
-        private void Form1_Load(object sender, EventArgs e)
-        {
-
-        }
-
-        private void btnStartContinuous_Click(object sender, EventArgs e)
-        {
-            if (!_bluetoothManager.IsConnected)
-            {
-                UpdateStatus("Cannot start continuous mode: Not connected to Bluetooth device");
-                return;
-            }
-
-            try
-            {
-                _continuousResponseCount = 0;
-                _bluetoothManager.StartContinuousTransmission();
-                
-                // Update all button states based on new mode
-                UpdateButtonStates(true);
-                
-                UpdateStatus("Started continuous transmission mode (10 packets every 500ms)");
-            }
-            catch (Exception ex)
-            {
-                UpdateStatus($"Error starting continuous mode: {ex.Message}");
-                UpdateButtonStates(true); // Ensure buttons are in correct state
-            }
-        }
-
-        private void btnStopContinuous_Click(object sender, EventArgs e)
-        {
-            try
-            {
-                _bluetoothManager.StopContinuousTransmission();
-                
-                // Update all button states based on new mode
-                UpdateButtonStates(true);
-                
-                UpdateStatus($"Stopped continuous transmission mode. Total response lists received: {_continuousResponseCount}");
-            }
-            catch (Exception ex)
-            {
-                UpdateStatus($"Error stopping continuous mode: {ex.Message}");
-                UpdateButtonStates(true); // Ensure buttons are in correct state
-            }
-        }
-
-        private void OnContinuousResponseReceived(List<byte[]> responses)
-        {
-            _continuousResponseCount++;
-            
-            if (InvokeRequired)
-            {
-                Invoke(new Action(() => OnContinuousResponseReceived(responses)));
-                return;
-            }
-
-            // Display response list every 10th reception to avoid flooding the UI
-            if (_continuousResponseCount % 10 == 0)
-            {
-                UpdateStatus($"=== CONTINUOUS RESPONSE LIST #{_continuousResponseCount} ===");
-                UpdateStatus($"Received {responses.Count}/10 responses:");
-                
-                for (int i = 0; i < Math.Min(responses.Count, 10); i++)
-                {
-                    var hexString = BitConverter.ToString(responses[i]).Replace("-", " ");
-                    UpdateStatus($"[{i + 1:D2}] {hexString}");
-                }
-                
-                if (responses.Count < 10)
-                {
-                    UpdateStatus($"Missing {10 - responses.Count} responses");
-                }
-                
-                UpdateStatus("=== END OF LIST ===");
-            }
-            else
-            {
-                // Just show a summary for other responses
-                UpdateStatus($"Continuous #{_continuousResponseCount}: {responses.Count}/10 responses received");
-            }
-        }
-
-        private void btnStartListen_Click(object sender, EventArgs e)
-        {
-            try
-            {
-                _bluetoothManager.StartListenOnlyMode();
-                
-                // Update all button states based on new mode
-                UpdateButtonStates(true);
-                
-                UpdateStatus("Started LISTEN-ONLY mode - just receiving data from robot...");
-            }
-            catch (Exception ex)
-            {
-                UpdateStatus($"Error starting listen-only mode: {ex.Message}");
-                UpdateButtonStates(true); // Ensure buttons are in correct state
-            }
-        }
-
-        private void btnStopListen_Click(object sender, EventArgs e)
-        {
-            try
-            {
-                _bluetoothManager.StopListenOnlyMode();
-                
-                // Update all button states based on new mode
-                UpdateButtonStates(true);
-                
-                UpdateStatus("Stopped listen-only mode - normal operation resumed");
-            }
-            catch (Exception ex)
-            {
-                UpdateStatus($"Error stopping listen-only mode: {ex.Message}");
-                UpdateButtonStates(true); // Ensure buttons are in correct state
-            }
-        }
-
-        // Bluetooth Adapter Management Event Handlers
         private void btnRefreshAdapters_Click(object sender, EventArgs e)
         {
             try
@@ -1253,225 +730,72 @@ namespace TeBot
             }
         }
 
-        private async Task ProcessScratch80ByteProtocol(byte[] data)
+   
+
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
         {
             try
             {
-                // Parse 80-byte structured packet
-                // Bytes 0-1: Header (0xAA, 0x55)
-                // Bytes 2-3: Request ID
-                // Byte 4: Data length
-                // Bytes 5-6: Timestamp
-                // Byte 7: Reserved
-                // Bytes 8-71: Command data (64 bytes max)
-                // Byte 72: Checksum
-                // Bytes 73-79: Padding
-                
-                if (data[0] != 0xAA || data[1] != 0x55)
-                {
-                    UpdateStatus("❌ Invalid packet header");
-                    await SendResponseToScratch(new List<byte[]>(), false, "Invalid header");
-                    return;
-                }
-                
-                int requestId = BitConverter.ToUInt16(data, 2);
-                int dataLength = data[4];
-                int timestamp = BitConverter.ToUInt16(data, 5);
-                byte checksum = data[72];
-                
-                // Verify checksum
-                byte calculatedChecksum = 0;
-                for (int i = 0; i < 72; i++)
-                {
-                    calculatedChecksum ^= data[i];
-                }
-                
-                if (checksum != calculatedChecksum)
-                {
-                    UpdateStatus($"❌ Checksum mismatch. Expected: {calculatedChecksum:X2}, Got: {checksum:X2}");
-                    await SendResponseToScratch(new List<byte[]>(), false, "Checksum error");
-                    return;
-                }
-                
-                // Extract command data
-                byte[] commandData = new byte[dataLength];
-                Array.Copy(data, 8, commandData, 0, Math.Min(dataLength, 64));
-                
-                UpdateStatus($"✅ Valid packet: ID={requestId}, Length={dataLength}, Commands={dataLength}");
-                
-                // Process the commands and send to robot
-                await ProcessCommandsToRobot(commandData, requestId);
+                // Ensure Bluetooth disconnects and resources are released
+                _bluetoothManager?.DisconnectAsync().Wait();
             }
             catch (Exception ex)
             {
-                UpdateStatus($"❌ Error in protocol processing: {ex.Message}");
-                await SendResponseToScratch(new List<byte[]>(), false, $"Protocol error: {ex.Message}");
+                UpdateStatus($"Error during closing: {ex.Message}");
             }
         }
 
-        private async Task ProcessCommandsToRobot(byte[] commands, int requestId)
+        /// <summary>
+        /// Handle robot data with immediate forwarding to Scratch - simple bridge
+        /// </summary>
+        private async void OnRobotDataReceived(byte[] robotData)
         {
             try
             {
-                // Split commands into 8-byte packets (max 8 packets from 64 bytes)
-                var packets = new List<byte[]>();
+                var robotHex = BitConverter.ToString(robotData).Replace("-", " ");
+                UpdateStatus($"🤖 Received {robotData.Length} bytes from robot: {robotHex}");
                 
-                for (int i = 0; i < commands.Length; i += 8)
+                // Check if this is a sensor response packet (starts with 0x10)
+                bool isSensorResponse = robotData.Length >= 1 && robotData[0] == 0x10;
+                
+                if (isSensorResponse)
                 {
-                    byte[] packet = new byte[8];
-                    int bytesToCopy = Math.Min(8, commands.Length - i);
-                    Array.Copy(commands, i, packet, 0, bytesToCopy);
-                    
-                    // Pad remaining bytes with zeros if needed
-                    for (int j = bytesToCopy; j < 8; j++)
-                    {
-                        packet[j] = 0x00;
-                    }
-                    
-                    packets.Add(packet);
-                }
-                
-                UpdateStatus($"🔄 Sending {packets.Count} packets to robot (Request ID: {requestId})...");
-                
-                // Send to robot and wait for response
-                bool success = await _bluetoothManager.SendDataArrayAsync(packets.ToArray());
-                
-                if (success)
-                {
-                    // Wait for robot response
-                    var responses = await WaitForResponsesWithTimeout(packets.Count, 3000);
-                    
-                    UpdateStatus($"✅ Robot responded: {responses.Count}/{packets.Count} packets received");
-                    
-                    // Send structured response back to Scratch
-                    await SendStructuredResponseToScratch(responses, requestId, true, "Success");
-                    
-                    // Update counters
-                    Interlocked.Increment(ref _dataPacketsSent);
-                    BeginInvoke(new Action(() =>
-                    {
-                        lblDataCount.Text = $"Scratch commands processed: {_dataPacketsSent}";
-                    }));
+                    UpdateStatus($"🎯 SENSOR DATA - forwarding immediately to Scratch");
                 }
                 else
                 {
-                    UpdateStatus("❌ Failed to send data to robot");
-                    await SendStructuredResponseToScratch(new List<byte[]>(), requestId, false, "Robot send failed");
+                    UpdateStatus($"📋 OTHER DATA - forwarding to Scratch");
                 }
-            }
-            catch (Exception ex)
-            {
-                UpdateStatus($"❌ Error processing commands: {ex.Message}");
-                await SendStructuredResponseToScratch(new List<byte[]>(), requestId, false, $"Command error: {ex.Message}");
-            }
-        }
-
-        private async Task SendStructuredResponseToScratch(List<byte[]> robotResponses, int requestId, bool success, string message)
-        {
-            try
-            {
-                // Create 80-byte response packet
-                byte[] responsePacket = new byte[80];
                 
-                // Header
-                responsePacket[0] = 0xBB; // Response header
-                responsePacket[1] = 0x66; // Response header
-                
-                // Request ID (echo back)
-                BitConverter.GetBytes((ushort)requestId).CopyTo(responsePacket, 2);
-                
-                // Status
-                responsePacket[4] = (byte)(success ? 0x01 : 0x00);
-                responsePacket[5] = (byte)robotResponses.Count;
-                
-                // Timestamp
-                BitConverter.GetBytes((ushort)(DateTime.Now.Ticks & 0xFFFF)).CopyTo(responsePacket, 6);
-                
-                // Robot response data (up to 64 bytes)
-                int dataOffset = 8;
-                foreach (var response in robotResponses.Take(8)) // Max 8 responses
+                // Check if WebSocket server is running and has clients
+                if (_webSocketServer == null)
                 {
-                    if (dataOffset + 8 <= 72) // Leave space for checksum and padding
+                    UpdateStatus($"❌ WebSocket server is null - cannot send data");
+                    return;
+                }
+                
+                UpdateStatus($"📡 Attempting to send {robotData.Length} bytes to WebSocket clients...");
+                
+                try
+                {
+                    // Send ALL robot data immediately to Scratch (simplified approach)
+                    await _webSocketServer.SendToAllClientsAsync(robotData);
+                    UpdateStatus($"✅ Robot data forwarded to Scratch: {robotHex}");
+                }
+                catch (Exception wsEx)
+                {
+                    UpdateStatus($"❌ WebSocket send failed: {wsEx.Message}");
+                    UpdateStatus($"   Exception type: {wsEx.GetType().Name}");
+                    if (wsEx.InnerException != null)
                     {
-                        response.CopyTo(responsePacket, dataOffset);
-                        dataOffset += 8;
+                        UpdateStatus($"   Inner exception: {wsEx.InnerException.Message}");
                     }
                 }
-                
-                // Checksum
-                byte checksum = 0;
-                for (int i = 0; i < 72; i++)
-                {
-                    checksum ^= responsePacket[i];
-                }
-                responsePacket[72] = checksum;
-                
-                // Padding (bytes 73-79 already initialized to 0)
-                
-                // Send response back to Scratch
-                await _webSocketServer.SendToAllClientsAsync(responsePacket);
-                
-                UpdateStatus($"📤 Sent response to Scratch: ID={requestId}, Success={success}, Data={robotResponses.Count} packets");
             }
             catch (Exception ex)
             {
-                UpdateStatus($"❌ Error sending structured response: {ex.Message}");
-            }
-        }
-
-        private void OnScratchConnected(string sessionId)
-        {
-            UpdateStatus($"🔗 Scratch connected (Session: {sessionId})");
-        }
-
-        private void OnScratchDisconnected(string sessionId)
-        {
-            UpdateStatus($"🔌 Scratch disconnected (Session: {sessionId}) - Stopping all robot operations");
-            
-            try
-            {
-                // CRITICAL: Immediately clear all queues to prevent further commands
-                _bluetoothManager?.ClearQueue();
-                
-                // Stop any continuous operations
-                if (_bluetoothManager?.IsContinuousMode == true)
-                {
-                    _ = Task.Run(() =>
-                    {
-                        try
-                        {
-                            _bluetoothManager.StopContinuousTransmission();
-                            UpdateStatus("🛑 Stopped continuous mode due to Scratch disconnect");
-                        }
-                        catch (Exception ex)
-                        {
-                            UpdateStatus($"⚠️ Error stopping continuous mode: {ex.Message}");
-                        }
-                    });
-                }
-                
-                // Stop any listen-only operations
-                if (_bluetoothManager?.IsListenOnlyMode == true)
-                {
-                    _ = Task.Run(() =>
-                    {
-                        try
-                        {
-                            _bluetoothManager.StopListenOnlyMode();
-                            UpdateStatus("🛑 Stopped listen-only mode due to Scratch disconnect");
-                        }
-                        catch (Exception ex)
-                        {
-                            UpdateStatus($"⚠️ Error stopping listen mode: {ex.Message}");
-                        }
-                    });
-                }
-                
-                UpdateStatus("✅ All operations stopped - no further commands will be sent to robot");
-            }
-            catch (Exception ex)
-            {
-                UpdateStatus($"❌ Error during Scratch disconnect cleanup: {ex.Message}");
+                UpdateStatus($"❌ Error in OnRobotDataReceived: {ex.Message}");
+                UpdateStatus($"   Exception type: {ex.GetType().Name}");
             }
         }
     }
