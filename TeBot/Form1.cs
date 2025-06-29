@@ -726,12 +726,13 @@ namespace TeBot
 
    
 
-        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        private async void Form1_FormClosing(object sender, FormClosingEventArgs e)
         {
             try
             {
                 // Ensure Bluetooth disconnects and resources are released
-                _bluetoothManager?.DisconnectAsync().Wait();
+                if (_bluetoothManager != null)
+                    await _bluetoothManager.DisconnectAsync();
             }
             catch (Exception ex)
             {
