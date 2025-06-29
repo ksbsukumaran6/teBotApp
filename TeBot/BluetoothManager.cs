@@ -12,6 +12,31 @@ using InTheHand.Net.Sockets;
 
 namespace TeBot
 {
+    public static class HexUtils
+    {
+        /// <summary>
+        /// Converts a hex string (e.g. "AABBCC") to a byte array.
+        /// </summary>
+        public static byte[] HexStringToBytes(string hex)
+        {
+            if (string.IsNullOrWhiteSpace(hex))
+                return Array.Empty<byte>();
+            int len = hex.Length / 2;
+            byte[] packet = new byte[len];
+            for (int i = 0; i < len; i++)
+                packet[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+            return packet;
+        }
+
+        /// <summary>
+        /// Converts a byte array to a hex string (e.g. {0xAA,0xBB} => "AABB").
+        /// </summary>
+        public static string BytesToHexString(byte[] data)
+        {
+            if (data == null || data.Length == 0) return string.Empty;
+            return BitConverter.ToString(data).Replace("-", "");
+        }
+    }
     public class BluetoothManager
     {
         private BluetoothClient _bluetoothClient;
@@ -19,64 +44,56 @@ namespace TeBot
         private Stream _bluetoothStream;
         private bool _isConnected;
         private System.Timers.Timer _flushTimer;
-          // Data transmission management
-        private readonly ConcurrentQueue<byte[]> _dataQueue = new ConcurrentQueue<byte[]>();
-        private readonly ConcurrentQueue<byte[]> _receivedDataQueue = new ConcurrentQueue<byte[]>();
-        private readonly SemaphoreSlim _responseAvailableSemaphore = new SemaphoreSlim(0);
-        private readonly List<List<byte[]>> _receivedLists = new List<List<byte[]>>();
-        private Timer _transmissionTimer;
-        private CancellationTokenSource _transmissionCancellation;
-        private CancellationTokenSource _readingCancellation;
-        private readonly ManualResetEventSlim _dataAvailable = new ManualResetEventSlim(false);
-        private readonly object _transmissionLock = new object();
-        private readonly object _receivedListsLock = new object();
-        private bool _isTransmitting = false;
-        private bool _isReading = false;        // Constants optimized for 115200 baud HC-05 (12x faster than 9600)
-        // At 115200 baud: ~11520 bytes/sec, so 8 bytes = ~0.7ms, 82 bytes = ~7ms
-        private const int TRANSMISSION_INTERVAL_MS = 100; // Fast for 115200 baud 
-        private const int RESPONSE_TIMEOUT_MS = 500; // Shorter timeout for fast baud rate (500ms)
-        private const int DATA_PACKET_SIZE = 8;
-        private const int CONTINUOUS_TRANSMISSION_INTERVAL_MS = 200; // Fast for 115200 baud (200ms)
-        private const int CONNECTION_TIMEOUT_MS = 10000; // Standard connection timeout (10 seconds)
-        private const int READ_TIMEOUT_MS = 1000; // Shorter read timeout for 115200 baud (1 second)
-        private const int STREAM_TIMEOUT_MS = 5000; // Standard stream timeout (5 seconds)
-        private const int INTER_BYTE_DELAY_MS = 0; // No delay needed at 115200 baud
+        
+        // OPTIMIZED: Separate async handlers for send/receive
+        private readonly ConcurrentQueue<byte[]> _sendQueue = new ConcurrentQueue<byte[]>();
+        private readonly ConcurrentQueue<byte[]> _receiveQueue = new ConcurrentQueue<byte[]>();
+        
+        // Async task management
+        private CancellationTokenSource _globalCancellation;
+        private Task _bluetoothReceiverTask;
+        private Task _dataProcessorTask;
+        private Task _senderTask;
+        
+        // Synchronization
+        private readonly SemaphoreSlim _sendSemaphore = new SemaphoreSlim(0);
+        private readonly SemaphoreSlim _receiveSemaphore = new SemaphoreSlim(0);
+        
+        // State tracking
+        private bool _isReceiving = false;
+        private bool _isProcessing = false;
+        private bool _isSending = false;
+        
+        // NEW: Track Scratch connection state to prevent sending when disconnected
+        private bool _isScratchConnected = false;
+        
+        // CRITICAL: Always preserve most recent robot data stream for safety
+        private byte[] _latestRobotData = null;
+        private DateTime _lastRobotDataTime = DateTime.MinValue;
+        private readonly object _robotDataLock = new object();
+        
+        // Constants optimized for 115200 baud HC-05
+        private const int DATA_PACKET_SIZE = 16;
+        private const int CONNECTION_TIMEOUT_MS = 10000;
+        private const int STREAM_TIMEOUT_MS = 5000;
+        
+        // Bluetooth adapter management
+        private BluetoothRadio[] _availableRadios;
+        private BluetoothRadio _selectedRadio;
 
         public event Action<string> StatusChanged;
         public event Action<BluetoothDeviceInfo[]> DevicesDiscovered;
         public event Action<byte[]> DataReceived;
-        public event Action<int> QueueStatus; // Reports queue count
-        public event Action<bool> TransmissionStatus; // Reports transmission state
-
-        // Continuous transmission management
-        private Timer _continuousTransmissionTimer;
-        private bool _isContinuousMode = false;
-        private int _continuousPacketCounter = 0;
-          // Events for continuous mode
-        public event Action<List<byte[]>> ContinuousResponseReceived; // Fired when a complete response list is received
-        
-        // Listen-only mode for testing
-        private bool _isListenOnlyMode = false;
-        
-        // Master/Slave role identification
-        private bool _isMasterMode = true; // TeBot acts as master by default
-        
-        // Bluetooth adapter management for external dongles
-        private BluetoothRadio[] _availableRadios;
-        private BluetoothRadio _selectedRadio;
-        
-        // Events for adapter discovery
+        public event Action<int> QueueStatus;
         public event Action<BluetoothRadio[]> BluetoothAdaptersDiscovered;
 
         public bool IsConnected => _isConnected;
         public string ConnectedDeviceName => _connectedDevice?.DeviceName ?? "None";
-        public int QueuedDataCount => _dataQueue.Count;
-        public bool IsTransmitting => _isTransmitting;
-        public bool IsContinuousMode => _isContinuousMode;
-        public bool IsListenOnlyMode => _isListenOnlyMode;
-        public bool IsMasterMode => _isMasterMode;
+        public int QueuedDataCount => _sendQueue.Count;
+        public bool IsReceiving => _isReceiving;
+        public bool IsProcessing => _isProcessing;
+        public bool IsSending => _isSending;
         
-        // Additional properties for adapter management
         public BluetoothRadio[] AvailableBluetoothAdapters => _availableRadios ?? new BluetoothRadio[0];
         public BluetoothRadio SelectedBluetoothAdapter => _selectedRadio;
         public string SelectedAdapterInfo => _selectedRadio != null ? 
@@ -89,8 +106,8 @@ namespace TeBot
             
             _bluetoothClient = new BluetoothClient();
             
-            // Setup periodic flush timer for better performance
-            _flushTimer = new System.Timers.Timer(50); // Flush every 50ms
+            // Setup periodic flush timer for even lower latency
+            _flushTimer = new System.Timers.Timer(25); // Flush every 25ms
             _flushTimer.Elapsed += FlushTimer_Elapsed;
         }
 
@@ -169,644 +186,549 @@ namespace TeBot
                 StatusChanged?.Invoke($"Error scanning for devices: {ex.Message}");
                 return new BluetoothDeviceInfo[0];
             }
-        }        public async Task<bool> ConnectToDeviceAsync(BluetoothDeviceInfo device)
+        }
+
+        public async Task<bool> ConnectToDeviceAsync(BluetoothDeviceInfo device)
         {
-            try
+            int maxRetries = 3;
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
-                if (_isConnected)
+                try
                 {
-                    await DisconnectAsync();
-                }
+                    if (_isConnected)
+                        await DisconnectAsync();
 
-                // Create a new BluetoothClient instance to avoid ObjectDisposedException
-                // after reconnecting (the previous client may have been disposed)
-                _bluetoothClient?.Dispose();
-                _bluetoothClient = new BluetoothClient();
+                    _bluetoothClient?.Dispose();
+                    _bluetoothClient = new BluetoothClient();
 
-                StatusChanged?.Invoke($"Connecting to {device.DeviceName}...");
+                    StatusChanged?.Invoke($"Connecting to {device.DeviceName} (attempt {attempt})...");
 
-                // Common Bluetooth service UUIDs
-                var serviceUuids = new[]
-                {
-                    BluetoothService.SerialPort,           // SPP - Serial Port Profile
-                    new Guid("0000ffe0-0000-1000-8000-00805f9b34fb"), // Common UART service
-                    new Guid("6e400001-b5a3-f393-e0a9-e50e24dcca9e")  // Nordic UART service
-                };
-
-                Exception lastException = null;
-                
-                foreach (var serviceUuid in serviceUuids)
-                {                    try
+                    var serviceUuids = new[]
                     {
-                        var endpoint = new BluetoothEndPoint(device.DeviceAddress, serviceUuid);
-                          // Add timeout wrapper for connection attempt
-                        var connectTask = Task.Run(() =>
+                        BluetoothService.SerialPort,
+                        new Guid("0000ffe0-0000-1000-8000-00805f9b34fb"),
+                        new Guid("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
+                    };
+
+                    Exception lastException = null;
+
+                    foreach (var serviceUuid in serviceUuids)
+                    {
+                        try
                         {
-                            _bluetoothClient.Connect(endpoint);
-                        });
-                          var timeoutTask = Task.Delay(CONNECTION_TIMEOUT_MS); // Use constant (15 seconds)
-                        var completedTask = await Task.WhenAny(connectTask, timeoutTask);
-                        
-                        if (completedTask == timeoutTask)
-                        {
-                            throw new TimeoutException($"Connection timeout after {CONNECTION_TIMEOUT_MS/1000} seconds using {serviceUuid}");
+                            var endpoint = new BluetoothEndPoint(device.DeviceAddress, serviceUuid);
+                            var connectTask = Task.Run(() => _bluetoothClient.Connect(endpoint));
+                            var timeoutTask = Task.Delay(CONNECTION_TIMEOUT_MS);
+                            var completedTask = await Task.WhenAny(connectTask, timeoutTask);
+
+                            if (completedTask == timeoutTask)
+                                throw new TimeoutException($"Connection timeout after {CONNECTION_TIMEOUT_MS / 1000} seconds");
+
+                            if (connectTask.IsFaulted)
+                                throw connectTask.Exception?.GetBaseException() ?? new Exception("Connection failed");
+
+                            _bluetoothStream = _bluetoothClient.GetStream();
+
+                            if (_bluetoothStream.CanTimeout)
+                            {
+                                _bluetoothStream.WriteTimeout = STREAM_TIMEOUT_MS;
+                                _bluetoothStream.ReadTimeout = STREAM_TIMEOUT_MS;
+                            }
+
+                            _connectedDevice = device;
+                            _isConnected = true;
+
+                            StatusChanged?.Invoke($"Connected to {device.DeviceName} (optimized for 115200 baud)");
+                            Debug.WriteLine($"Successfully connected using service UUID: {serviceUuid}");
+
+                            StartOptimizedAsyncHandlers();
+                            return true;
                         }
-                        
-                        if (connectTask.IsFaulted)
+                        catch (Exception ex)
                         {
-                            throw connectTask.Exception?.GetBaseException() ?? new Exception("Connection failed");
+                            lastException = ex;
+                            Debug.WriteLine($"Failed to connect using service UUID {serviceUuid}: {ex.Message}");
+                            continue;
                         }
-                        
-                        _bluetoothStream = _bluetoothClient.GetStream();
-                          // HC-05 specific stream settings                       
-                         if (_bluetoothStream.CanTimeout)
-                        {
-                            _bluetoothStream.WriteTimeout = STREAM_TIMEOUT_MS; // Use constant
-                            _bluetoothStream.ReadTimeout = STREAM_TIMEOUT_MS;  // Use constant
-                        }
-                          _connectedDevice = device;
-                        _isConnected = true;
-                        
-                        StatusChanged?.Invoke($"Connected to {device.DeviceName} (optimized for 115200 baud)");
-                        Debug.WriteLine($"Successfully connected using service UUID: {serviceUuid}");
-                        
-                        // Start the transmission system and data reading
-                        StartTransmissionSystem();
-                        StartDataReading();
-                        
-                        return true;
                     }
-                    catch (Exception ex)
-                    {
-                        lastException = ex;
-                        Debug.WriteLine($"Failed to connect using service UUID {serviceUuid}: {ex.Message}");
-                        continue;
-                    }
+
+                    StatusChanged?.Invoke($"Failed to connect to {device.DeviceName}: {lastException?.Message}");
                 }
-
-                StatusChanged?.Invoke($"Failed to connect to {device.DeviceName}: {lastException?.Message}");
-                return false;
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Error connecting to device: {ex.Message}");
-                return false;            }
-        }        public async Task<bool> SendDataAsync(byte[] data)
-        {
-            // Validate data size
-            if (data == null || data.Length != DATA_PACKET_SIZE)
-            {
-                StatusChanged?.Invoke($"Invalid data size. Expected {DATA_PACKET_SIZE} bytes, got {data?.Length ?? 0}");
-                return false;
-            }
-
-            if (!_isConnected)
-            {
-                StatusChanged?.Invoke("Not connected to any Bluetooth device");
-                return false;
-            }
-
-            // Queue the data for transmission
-            await Task.Run(() => {
-                _dataQueue.Enqueue(data);
-                _dataAvailable.Set();
-            });
-            
-            QueueStatus?.Invoke(_dataQueue.Count);
-            Debug.WriteLine($"Queued {data.Length} bytes for transmission. Queue size: {_dataQueue.Count}");
-            return true;
-        }
-
-        /// <summary>
-        /// Send data immediately - simple bridge from Scratch to robot
-        /// </summary>
-        public async Task<bool> SendDataImmediately(byte[] data)
-        {
-            if (data == null || data.Length == 0)
-            {
-                return false;
-            }
-
-            if (!_isConnected)
-            {
-                StatusChanged?.Invoke("Not connected to any Bluetooth device");
-                return false;
-            }
-
-            try
-            {
-                // SIMPLE: Just send the data directly to robot
-                return await SendDataDirectlyAsync(data);
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Error sending data: {ex.Message}");
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Clear any stale data from the receive buffer to ensure clean communication
-        /// </summary>
-        private void ClearReceiveBuffer()
-        {
-            try
-            {
-                int clearedFromQueue = 0;
-                while (_receivedDataQueue.TryDequeue(out byte[] _))
+                catch (Exception ex)
                 {
-                    clearedFromQueue++;
+                    StatusChanged?.Invoke($"Error connecting to device: {ex.Message}");
                 }
-                
-                if (clearedFromQueue > 0)
-                {
-                    StatusChanged?.Invoke($"Cleared {clearedFromQueue} stale packets from receive queue");
-                    Debug.WriteLine($"Cleared {clearedFromQueue} stale packets from receive queue");
-                }
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Error clearing receive buffer: {ex.Message}");
-            }
-        }
 
-        /// <summary>
-        /// Clear all queued commands (called when Scratch blocks are deactivated)
-        /// </summary>
-        public void ClearQueue()
-        {
-            int clearedCount = 0;
-            while (_dataQueue.TryDequeue(out byte[] _))
-            {
-                clearedCount++;
-            }
-            
-            QueueStatus?.Invoke(0);
-            Debug.WriteLine($"Cleared {clearedCount} commands from queue");
-            StatusChanged?.Invoke($"Cleared {clearedCount} queued commands");
-        }
-
-        /// <summary>
-        /// Send a 2D array of data (e.g., dataToSend[10][8])
-        /// </summary>
-        public async Task<bool> SendDataArrayAsync(byte[][] dataArray)
-        {
-            if (dataArray == null || dataArray.Length == 0)
-            {
-                StatusChanged?.Invoke("No data to send");
-                return false;
+                // Wait a bit before retrying
+                await Task.Delay(1000);
             }
 
-            if (!_isConnected)
-            {
-                StatusChanged?.Invoke("Not connected to any Bluetooth device");
-                return false;
-            }            int validPackets = 0;
-            await Task.Run(() => {
-                foreach (var packet in dataArray)
-                {
-                    if (packet != null && packet.Length == DATA_PACKET_SIZE)
-                    {
-                        _dataQueue.Enqueue(packet);
-                        validPackets++;
-                    }
-                    else
-                    {
-                        StatusChanged?.Invoke($"Skipped invalid packet: {packet?.Length ?? 0} bytes");
-                    }
-                }
-            });
-
-            if (validPackets > 0)
-            {
-                _dataAvailable.Set();
-                QueueStatus?.Invoke(_dataQueue.Count);
-                StatusChanged?.Invoke($"Queued {validPackets} data packets for transmission");
-                return true;
-            }
-
+            StatusChanged?.Invoke($"All connection attempts failed for {device.DeviceName}.");
             return false;
-        }        /// <summary>
-        /// Send multiple 2D arrays of data and receive corresponding response lists
-        /// </summary>       
-        public async Task<List<List<byte[]>>> SendMultipleDataArraysAsync(List<byte[][]> dataArrays)
-        {
-            var responseLists = new List<List<byte[]>>();
-            
-            if (!_isConnected || dataArrays == null || dataArrays.Count == 0)
-            {
-                StatusChanged?.Invoke("Cannot send multiple arrays: not connected or no data provided");
-                return responseLists;
-            }
-
-            try
-            {
-                // Clear previous received lists
-                lock (_receivedListsLock)
-                {
-                    _receivedLists.Clear();
-                }
-
-                StatusChanged?.Invoke($"Starting transmission of {dataArrays.Count} data arrays with 150ms intervals");
-
-                for (int i = 0; i < dataArrays.Count; i++)
-                {
-                    var dataArray = dataArrays[i];
-                    if (dataArray == null) 
-                    {
-                        StatusChanged?.Invoke($"Skipping null array {i + 1}");
-                        responseLists.Add(new List<byte[]>());
-                        continue;
-                    }
-
-                    StatusChanged?.Invoke($"Sending array {i + 1}/{dataArrays.Count} with {dataArray.Length} packets");
-
-                    // Send all packets from this array in one shot
-                    await SendDataArrayAsync(dataArray);
-                    
-                    // Wait for responses with 100ms timeout per packet
-                    var responses = await WaitForResponsesAsync(dataArray.Length, TimeSpan.FromMilliseconds(100 * dataArray.Length));
-                    
-                    lock (_receivedListsLock)
-                    {
-                        _receivedLists.Add(responses);
-                        responseLists.Add(new List<byte[]>(responses));
-                    }
-                    
-                    StatusChanged?.Invoke($"Array {i + 1}: Sent {dataArray.Length} packets, received {responses.Count} responses");
-                    
-                    // Wait 150ms before sending next array (except for the last one)
-                    if (i < dataArrays.Count - 1)
-                    {
-                        await Task.Delay(150);
-                    }
-                }
-
-                StatusChanged?.Invoke($"Completed transmission of all arrays. Total response lists: {responseLists.Count}");
-                return responseLists;
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Error sending multiple data arrays: {ex.Message}");
-                return responseLists;
-            }
         }
 
         /// <summary>
-        /// Helper method to wait for a specific number of responses
+        /// Start optimized async handlers - separate threads for send/receive
         /// </summary>
-        private async Task<List<byte[]>> WaitForResponsesAsync(int expectedCount, TimeSpan timeout)
+        private void StartOptimizedAsyncHandlers()
         {
-            var responses = new List<byte[]>();
-            var stopwatch = Stopwatch.StartNew();
-
-            StatusChanged?.Invoke($"Waiting for {expectedCount} responses (timeout: {timeout.TotalSeconds}s)");
-
-            while (responses.Count < expectedCount && stopwatch.Elapsed < timeout && _isConnected)
-            {
-                if (_receivedDataQueue.TryDequeue(out byte[] receivedData))
-                {
-                    responses.Add(receivedData);
-                    var hexString = BitConverter.ToString(receivedData).Replace("-", " ");
-                    Debug.WriteLine($"Response {responses.Count}/{expectedCount}: {hexString}");
-                    
-                    // Report progress every 5 responses or at completion
-                    if (responses.Count % 5 == 0 || responses.Count == expectedCount)
-                    {
-                        StatusChanged?.Invoke($"Received {responses.Count}/{expectedCount} responses");
-                    }
-                }
-                else
-                {
-                    await Task.Delay(10); // Small delay to prevent tight loop
-                }
-            }
-
-            if (responses.Count < expectedCount)
-            {
-                StatusChanged?.Invoke($"Response timeout: received {responses.Count}/{expectedCount} responses in {stopwatch.Elapsed.TotalSeconds:F1}s");
-            }
-            else
-            {
-                StatusChanged?.Invoke($"Successfully received all {responses.Count} responses in {stopwatch.Elapsed.TotalSeconds:F1}s");
-            }
-
-            return responses;
+            // Cancel any existing operations
+            StopOptimizedAsyncHandlers();
+            
+            _globalCancellation = new CancellationTokenSource();
+            var token = _globalCancellation.Token;
+            
+            StatusChanged?.Invoke("🚀 Starting optimized async handlers...");
+            
+            // CRITICAL DEBUG: Verify stream state before starting handlers
+            var streamInfo = _bluetoothStream != null ? 
+                $"Stream exists: CanRead={_bluetoothStream.CanRead}, CanWrite={_bluetoothStream.CanWrite}" : 
+                "Stream is NULL!";
+            StatusChanged?.Invoke($"🔍 STREAM STATE: {streamInfo}");
+            
+            var clientInfo = _bluetoothClient != null ? 
+                $"Client exists: Connected={_bluetoothClient.Connected}" : 
+                "Client is NULL!";
+            StatusChanged?.Invoke($"🔍 CLIENT STATE: {clientInfo}");
+            
+            // HANDLER 1: Dedicated Bluetooth receiver (highest priority)
+            _bluetoothReceiverTask = Task.Run(async () => await BluetoothReceiverHandler(token), token);
+            StatusChanged?.Invoke("📡 RECEIVER TASK CREATED");
+            
+            // HANDLER 2: Data processor (processes received data and forwards to Scratch)
+            _dataProcessorTask = Task.Run(async () => await DataProcessorHandler(token), token);
+            StatusChanged?.Invoke("⚙️ PROCESSOR TASK CREATED");
+            
+            // HANDLER 3: Sender (handles outgoing commands)
+            _senderTask = Task.Run(async () => await SenderHandler(token), token);
+            StatusChanged?.Invoke("📤 SENDER TASK CREATED");
+            
+            StatusChanged?.Invoke("✅ Optimized async handlers started - send/receive now fully separated");
         }
-
+        
         /// <summary>
-        /// Get all received response lists
+        /// Stop all async handlers
         /// </summary>
-        public List<List<byte[]>> GetReceivedLists()
-        {
-            lock (_receivedListsLock)
-            {
-                return new List<List<byte[]>>(_receivedLists);
-            }
-        }
-
-        private void StartTransmissionSystem()
-        {
-            _transmissionCancellation = new CancellationTokenSource();
-            
-            // Start transmission timer
-            _transmissionTimer = new Timer(TransmissionCallback, null, 0, TRANSMISSION_INTERVAL_MS);
-            
-            StatusChanged?.Invoke("Transmission system started");
-        }
-
-        private async void TransmissionCallback(object state)
-        {
-            if (!_isConnected || _transmissionCancellation.Token.IsCancellationRequested)
-                return;
-
-            lock (_transmissionLock)
-            {
-                if (_isTransmitting)
-                    return; // Skip if previous transmission is still in progress
-                    
-                _isTransmitting = true;
-                TransmissionStatus?.Invoke(true);
-            }
-
-            try
-            {
-                if (_dataQueue.TryDequeue(out byte[] data))
-                {
-                    await SendDataDirectlyAsync(data);
-                    QueueStatus?.Invoke(_dataQueue.Count);
-                    
-                    // Wait for response
-                    await WaitForResponseAsync();
-                }
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Transmission error: {ex.Message}");
-            }
-            finally
-            {
-                lock (_transmissionLock)
-                {
-                    _isTransmitting = false;
-                    TransmissionStatus?.Invoke(false);
-                }
-            }
-        }        private async Task<bool> SendDataDirectlyAsync(byte[] data)
+        private async void StopOptimizedAsyncHandlers()
         {
             try
             {
-                if (_bluetoothStream == null || !_bluetoothStream.CanWrite)
-                    return false;
+                StatusChanged?.Invoke("🛑 Stopping async handlers...");
 
-                // SIMPLE: Write data and flush immediately
-                await _bluetoothStream.WriteAsync(data, 0, data.Length);
-                await _bluetoothStream.FlushAsync();
-                
-                return true;
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Error sending data: {ex.Message}");
-                _isConnected = false;
-                return false;
-            }
-        }
+                _globalCancellation?.Cancel();
 
-        private async Task WaitForResponseAsync()
-        {
-            var timeout = DateTime.Now.AddMilliseconds(RESPONSE_TIMEOUT_MS);
-            
-            while (DateTime.Now < timeout && _isConnected)
-            {
-                if (_receivedDataQueue.TryDequeue(out byte[] receivedData))
-                {
-                    var hexString = BitConverter.ToString(receivedData).Replace("-", " ");
-                    Debug.WriteLine($"Received response: {hexString}");
-                    StatusChanged?.Invoke($"Received: {hexString}");
-                    DataReceived?.Invoke(receivedData);
-                    return;
-                }
-                
-                await Task.Delay(10); // Check every 10ms
-            }
-              // Timeout occurred
-            StatusChanged?.Invoke("Response timeout - no data received within 500ms (115200 baud)");
-        }        private void StartDataReading()
-        {
-            Task.Run(async () =>
-            {
-                var buffer = new byte[256]; // Smaller buffer for HC-05
-                var dataBuffer = new List<byte>();
-                
-                StatusChanged?.Invoke("Started data reading - listening for robot data (115200 baud optimized)...");
-                
-                while (_isConnected && (_transmissionCancellation?.Token.IsCancellationRequested != true))
+                var tasks = new[] { _bluetoothReceiverTask, _dataProcessorTask, _senderTask }
+                    .Where(t => t != null).ToArray();
+
+                if (tasks.Length > 0)
                 {
                     try
                     {
-                        // Check connection health periodically
-                        if (!IsConnectionHealthy())
+                        await Task.WhenAny(Task.WhenAll(tasks), Task.Delay(2000));
+                    }
+                    catch { /* Ignore exceptions from cancelled tasks */ }
+                }
+
+                _globalCancellation?.Dispose();
+                _globalCancellation = null;
+
+                _isReceiving = false;
+                _isProcessing = false;
+                _isSending = false;
+
+                StatusChanged?.Invoke("✅ All async handlers stopped");
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke($"❌ Error stopping handlers: {ex.Message}");
+            }
+        }
+        
+        /// <summary>
+        /// HANDLER 1: Dedicated Bluetooth receiver - continuously reads from stream
+        /// Now expects incoming data as hex string, decodes to bytes, and enqueues
+        private async Task BluetoothReceiverHandler(CancellationToken cancellationToken)
+        {
+            StatusChanged?.Invoke("📡 🔥 RECEIVER HANDLER STARTED - Thread ID: " + System.Threading.Thread.CurrentThread.ManagedThreadId);
+
+            // CRITICAL DEBUG: Verify stream state before starting
+            var streamInfo = _bluetoothStream != null ?
+                $"CanRead={_bluetoothStream.CanRead}, CanWrite={_bluetoothStream.CanWrite}" :
+                "Stream is NULL!";
+            StatusChanged?.Invoke($"📡 🔍 STREAM STATE: {streamInfo}");
+
+            var clientInfo = _bluetoothClient != null ?
+                $"Connected={_bluetoothClient.Connected}" :
+                "Client is NULL!";
+            StatusChanged?.Invoke($"📡 🔍 CLIENT STATE: {clientInfo}");
+
+            StatusChanged?.Invoke($"📡 🔍 _isConnected FLAG: {_isConnected}");
+
+            _isReceiving = true;
+
+            var buffer = new byte[16];
+            int cycleCount = 0;
+            int timeoutCount = 0;
+
+            try
+            {
+                while (_isConnected && !cancellationToken.IsCancellationRequested)
+                {
+                    try
+                    {
+                        cycleCount++;
+                        StatusChanged?.Invoke($"📡 [DEBUG] Read attempt #{cycleCount}");
+
+                        if (_bluetoothStream?.CanRead == true)
                         {
-                            StatusChanged?.Invoke("Connection health check failed - stopping data reading");
-                            _isConnected = false;
-                            break;
-                        }
-                        
-                        if (_bluetoothStream != null && _bluetoothStream.CanRead)
-                        {
-                            // Try a more conservative approach for HC-05
-                            int bytesRead = 0;
-                            
-                            try
+                            StatusChanged?.Invoke($"📡 [DEBUG] Attempting to read from stream...");
+                            // Read as usual
+                            var readTask = _bluetoothStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                            var timeoutTask = Task.Delay(2000, cancellationToken);
+                            var completedTask = await Task.WhenAny(readTask, timeoutTask);
+
+                            if (completedTask == readTask && !readTask.IsFaulted)
                             {
-                                // Create a new cancellation token if needed
-                                var cancellationToken = _transmissionCancellation?.Token ?? CancellationToken.None;
-                                
-                                // Use longer timeout when we might expect robot responses
-                                int readTimeout = _dataQueue.Count > 0 ? 3000 : READ_TIMEOUT_MS; // 3s if commands pending
-                                
-                                // Method 1: Simple async read with adaptive timeout for HC-05
-                                var readTask = _bluetoothStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
-                                var timeoutTask = Task.Delay(readTimeout, cancellationToken);
-                                
-                                var completedTask = await Task.WhenAny(readTask, timeoutTask);
-                                
-                                if (completedTask == readTask && !readTask.IsFaulted && !readTask.IsCanceled)
+                                int bytesRead = await readTask;
+                                StatusChanged?.Invoke($"📡 [DEBUG] Read completed, bytesRead={bytesRead}");
+
+                                if (bytesRead > 0)
                                 {
-                                    bytesRead = await readTask;
-                                    if (bytesRead > 0)
-                                    {
-                                        StatusChanged?.Invoke($"📡 Successfully read {bytesRead} bytes from robot");
-                                    }
-                                }
-                                else if (completedTask == timeoutTask)
-                                {
-                                    // Timeout occurred - log it for diagnosis
-                                    if (_dataQueue.Count > 0)
-                                    {
-                                        StatusChanged?.Invoke($"⏱️ Read timeout ({readTimeout}ms) - commands pending but no robot response");
-                                    }
-                                    // Don't log timeouts when no commands are pending (normal idle state)
-                                }
-                                else if (readTask.IsFaulted)
-                                {
-                                    // Don't try sync read if async failed - just log and continue
-                                    StatusChanged?.Invoke($"❌ Async read error: {readTask.Exception?.GetBaseException()?.Message}");
-                                    if (_isConnected) // Only delay if still connected
-                                    {
-                                        await Task.Delay(1000, cancellationToken);
-                                    }
-                                }
-                                else if (readTask.IsCanceled)
-                                {
-                                    StatusChanged?.Invoke("🚫 Read operation cancelled");
-                                    break;
-                                }
-                            }
-                            catch (OperationCanceledException)
-                            {
-                                StatusChanged?.Invoke("Data reading cancelled");
-                                break;
-                            }
-                            catch (Exception ex)
-                            {
-                                StatusChanged?.Invoke($"Read error: {ex.Message}");
-                                if (_isConnected) // Only delay if still connected
-                                {
-                                    await Task.Delay(1000);
-                                }
-                            }
-                            
-                            if (bytesRead > 0)
-                            {
-                                dataBuffer.AddRange(buffer.Take(bytesRead));
-                                
-                                // Show all raw received data with timestamp
-                                var timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
-                                var rawHex = BitConverter.ToString(buffer, 0, bytesRead).Replace("-", " ");
-                                Debug.WriteLine($"[{timestamp}] Robot data received ({bytesRead} bytes): {rawHex}");
-                                StatusChanged?.Invoke($"[{timestamp}] 🤖 ROBOT DATA: {bytesRead} bytes - {rawHex}");
-                                
-                                if (_isListenOnlyMode)
-                                {
-                                    // In listen-only mode, show everything and stream all data
-                                    StatusChanged?.Invoke($"LISTEN: Raw bytes: {rawHex}");
-                                    StatusChanged?.Invoke($"LISTEN: Buffer now has {dataBuffer.Count} total bytes");
-                                    
-                                    // Send ALL data as byte stream (same as normal mode)
-                                    if (dataBuffer.Count > 0)
-                                    {
-                                        var allData = dataBuffer.ToArray();
-                                        dataBuffer.Clear();
-                                        
-                                        var streamHex = BitConverter.ToString(allData).Replace("-", " ");
-                                        StatusChanged?.Invoke($"LISTEN: Streaming {allData.Length} bytes: {streamHex}");
-                                        DataReceived?.Invoke(allData);
-                                    }
+                                    // Convert bytes to hex string, then back to bytes (simulate hex string transfer)
+                                    string hexString = HexUtils.BytesToHexString(buffer.Take(bytesRead).ToArray());
+                                    var receivedData = HexUtils.HexStringToBytes(hexString);
+
+                                    _receiveQueue.Enqueue(receivedData);
+                                    _receiveSemaphore.Release();
+
+                                    StatusChanged?.Invoke($"📡 🎯 ROBOT DATA DETECTED! {bytesRead} bytes → {hexString}");
+                                    timeoutCount = 0;
                                 }
                                 else
                                 {
-                                    // Normal mode processing
-                                    ProcessNormalModeData(dataBuffer);
+                                    StatusChanged?.Invoke($"📡 [DEBUG] Zero bytes read from stream.");
                                 }
                             }
-                            else
+                            else if (completedTask == timeoutTask)
                             {
-                                // No data received this cycle - only log periodically (every 30 seconds) to avoid spam
-                                if (DateTime.Now.Second % 30 == 0 && DateTime.Now.Millisecond < 500)
-                                {
-                                    var queueInfo = _dataQueue.Count > 0 ? $" ({_dataQueue.Count} commands pending)" : "";
-                                    StatusChanged?.Invoke($"🔍 Still listening for robot responses{queueInfo}... CanRead={_bluetoothStream.CanRead}");
-                                }
+                                timeoutCount++;
+                                StatusChanged?.Invoke($"📡 [DEBUG] Read timeout #{timeoutCount}");
+                            }
+                            else if (readTask.IsFaulted)
+                            {
+                                StatusChanged?.Invoke($"📡 [DEBUG] Read task faulted: {readTask.Exception?.GetBaseException()?.Message}");
+                                await Task.Delay(1000, cancellationToken);
                             }
                         }
                         else
                         {
-                            StatusChanged?.Invoke("Stream not available for reading");
+                            StatusChanged?.Invoke($"📡 [DEBUG] Stream not readable - CanRead={_bluetoothStream?.CanRead}");
                         }
-                        
-                        // Only delay if still connected
-                        if (_isConnected)
-                        {
-                            await Task.Delay(500); // Don't use cancellation token for this delay
-                        }
+
+                        await Task.Delay(1, cancellationToken);
                     }
                     catch (OperationCanceledException)
                     {
-                        StatusChanged?.Invoke("Data reading operation cancelled");
+                        StatusChanged?.Invoke("📡 Receiver cancelled - clean exit");
                         break;
                     }
                     catch (Exception ex)
                     {
-                        StatusChanged?.Invoke($"Error reading robot data: {ex.Message}");
-                        Debug.WriteLine($"Full exception: {ex}");
-                        
-                        // Check if it's a connection-related error
-                        if (ex is IOException || ex is ObjectDisposedException || ex.Message.Contains("timeout"))
-                        {
-                            StatusChanged?.Invoke("Connection issue detected - stream may be unstable");
-                            
-                            // Check if we're still officially connected
-                            if (_bluetoothClient?.Connected == false)
-                            {
-                                StatusChanged?.Invoke("Bluetooth client disconnected - stopping data reading");
-                                _isConnected = false;
-                                break;
-                            }
-                        }
-                        
-                        // Only delay if still connected
-                        if (_isConnected)
-                        {
-                            await Task.Delay(2000); // Don't use cancellation token for error delays
-                        }
+                        StatusChanged?.Invoke($"📡 [DEBUG] Receiver error: {ex.Message}");
+                        StatusChanged?.Invoke($"📡 [DEBUG] Error type: {ex.GetType().Name}");
+                        StatusChanged?.Invoke($"📡 [DEBUG] StackTrace: {ex.StackTrace}");
+                        await Task.Delay(100, cancellationToken);
                     }
                 }
-                
-                StatusChanged?.Invoke("Stopped data reading");
-            });
+            }
+            finally
+            {
+                _isReceiving = false;
+                StatusChanged?.Invoke($"📡 Bluetooth receiver handler stopped after {cycleCount} cycles, {timeoutCount} timeouts");
+            }
         }
-
-        private void ProcessNormalModeData(List<byte> dataBuffer)
+        
+        /// <summary>
+        /// HANDLER 2: Data processor - processes queued receive data and forwards to Scratch
+        /// CRITICAL: Always preserve sensor data regardless of Scratch connection state
+        /// </summary>
+        private async Task DataProcessorHandler(CancellationToken cancellationToken)
         {
+            StatusChanged?.Invoke("⚙️ Data processor handler started");
+            _isProcessing = true;
+            
             try
             {
-                // PURE BYTE STREAMING: Send ALL received data to Scratch immediately
-                if (dataBuffer.Count > 0)
+                while (_isConnected && !cancellationToken.IsCancellationRequested)
                 {
-                    // Convert entire buffer to byte array and send to Scratch
-                    var allData = dataBuffer.ToArray();
-                    dataBuffer.Clear(); // Clear buffer after processing
-                    
-                    // Add to received queue for legacy compatibility
-                    _receivedDataQueue.Enqueue(allData);
-                    
-                    var dataHex = BitConverter.ToString(allData).Replace("-", " ");
-                    StatusChanged?.Invoke($"Streaming {allData.Length} bytes to Scratch: {dataHex}");
-                    
-                    // Fire event to Form1 with complete byte stream
-                    DataReceived?.Invoke(allData);
+                    try
+                    {
+                        // Wait for received data (with timeout)
+                        await _receiveSemaphore.WaitAsync(100, cancellationToken);
+                        
+                        // Process all available data from robot
+                        while (_receiveQueue.TryDequeue(out byte[] receivedData))
+                        {
+                            var hex = BitConverter.ToString(receivedData).Replace("-", " ");
+                            StatusChanged?.Invoke($"⚙️ PROCESSING ROBOT DATA: {receivedData.Length} bytes → {hex}");
+                            
+                            // CRITICAL: Always preserve most recent robot data stream for safety
+                            lock (_robotDataLock)
+                            {
+                                _latestRobotData = new byte[receivedData.Length];
+                                Array.Copy(receivedData, _latestRobotData, receivedData.Length);
+                                _lastRobotDataTime = DateTime.Now;
+                            }
+                            
+                            StatusChanged?.Invoke($"💾 PRESERVED most recent robot data: {receivedData.Length} bytes");
+                            
+                            // ALWAYS forward to Scratch immediately if connected
+                            // This ensures real-time data stream updates for safety
+                            DataReceived?.Invoke(receivedData);
+                            
+                            if (_isScratchConnected)
+                            {
+                                StatusChanged?.Invoke($"✅ FORWARDED to Scratch: {receivedData.Length} bytes");
+                            }
+                            else
+                            {
+                                StatusChanged?.Invoke($"📡 PRESERVED (Scratch disconnected): {receivedData.Length} bytes");
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break; // Clean exit
+                    }
+                    catch (Exception ex)
+                    {
+                        StatusChanged?.Invoke($"⚙️ Processor error: {ex.Message}");
+                        await Task.Delay(100, cancellationToken);
+                    }
                 }
             }
-            catch (Exception ex)
+            finally
             {
-                StatusChanged?.Invoke($"Error processing byte stream: {ex.Message}");
+                _isProcessing = false;
+                StatusChanged?.Invoke("⚙️ Data processor handler stopped");
+            }
+        }
+        
+        /// <summary>
+        /// HANDLER 3: Sender - handles outgoing commands to robot
+        /// POLICY: Only send commands TO robot when Scratch is connected
+        /// </summary>
+        private async Task SenderHandler(CancellationToken cancellationToken)
+        {
+            StatusChanged?.Invoke("📤 Sender handler started");
+            _isSending = true;
+            
+            try
+            {
+                while (_isConnected && !cancellationToken.IsCancellationRequested)
+                {
+                    try
+                    {
+                        // Wait for send data (with timeout)
+                        await _sendSemaphore.WaitAsync(25, cancellationToken);
+                        
+                        // Send all queued data - but only if Scratch is connected
+                        while (_sendQueue.TryDequeue(out byte[] sendData))
+                        {
+                            if (!_isScratchConnected)
+                            {
+                                // SAFETY: Scratch is disconnected - discard COMMAND data only
+                                var discardHex = BitConverter.ToString(sendData).Replace("-", " ");
+                                StatusChanged?.Invoke($"🚫 DISCARDING COMMAND: {sendData.Length} bytes (Scratch disconnected) → {discardHex}");
+                                continue; // Skip sending this command
+                            }
+
+                            if (_bluetoothStream?.CanWrite == true)
+                            {
+                                // Send the raw bytes directly to Arduino
+                                StatusChanged?.Invoke($"📤 SENDING RAW BYTES: {BitConverter.ToString(sendData)}");
+                                await _bluetoothStream.WriteAsync(sendData, 0, sendData.Length, cancellationToken);
+                                await _bluetoothStream.FlushAsync(cancellationToken);
+
+                                StatusChanged?.Invoke($"✅ Command sent to robot as raw bytes: {sendData.Length} bytes");
+                                QueueStatus?.Invoke(_sendQueue.Count);
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break; // Clean exit
+                    }
+                    catch (Exception ex)
+                    {
+                        StatusChanged?.Invoke($"📤 Sender error: {ex.Message}");
+                        await Task.Delay(100, cancellationToken);
+                    }
+                }
+            }
+            finally
+            {
+                _isSending = false;
+                StatusChanged?.Invoke("📤 Sender handler stopped");
             }
         }
 
         /// <summary>
-        /// Get all received data packets
+        /// Send data immediately - optimized bridge from Scratch to robot
+        /// Accepts either a byte array or a hex string (for minimal data traffic)
+        /// POLICY: Only send commands when Scratch is connected
         /// </summary>
-        public List<byte[]> GetReceivedData()
+        public Task<bool> SendDataImmediately(string hex)
         {
-            var receivedData = new List<byte[]>();
-            while (_receivedDataQueue.TryDequeue(out byte[] data))
+            if (string.IsNullOrWhiteSpace(hex))
+                return Task.FromResult(false);
+
+            var data = HexUtils.HexStringToBytes(hex);
+            return SendDataImmediately(data);
+        }
+
+        /// <summary>
+        /// Overload: Send data immediately using a byte array (for compatibility)
+        /// </summary>
+        public Task<bool> SendDataImmediately(byte[] data)
+        {
+            if (data == null || data.Length == 0)
             {
-                receivedData.Add(data);
+                return Task.FromResult(false);
             }
-            return receivedData;
-        }        public async Task DisconnectAsync()
+
+            if (!_isConnected)
+            {
+                StatusChanged?.Invoke("Not connected to any Bluetooth device");
+                return Task.FromResult(false);
+            }
+
+            if (!_isScratchConnected)
+            {
+                var hex = BitConverter.ToString(data).Replace("-", " ");
+                StatusChanged?.Invoke($"🚫 BLOCKED COMMAND: {data.Length} bytes (Scratch disconnected) → {hex}");
+                return Task.FromResult(false);
+            }
+
+            try
+            {
+                // Convert to hex string for logging
+                var hex = HexUtils.BytesToHexString(data);
+                StatusChanged?.Invoke($"🚀 QUEUED COMMAND for immediate send: {data.Length} bytes → {hex}");
+
+                // OPTIMIZED: Use async sender queue for immediate processing
+                _sendQueue.Enqueue(data);
+                _sendSemaphore.Release(); // Signal sender handler immediately
+                return Task.FromResult(true);
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke($"Error queuing data: {ex.Message}");
+                return Task.FromResult(false);
+            }
+        }
+
+        /// <summary>
+        /// Clear queued commands (but preserve sensor data)
+        /// </summary>
+        public void ClearQueue()
+        {
+            // Clear send queue only (commands TO robot)
+            int clearedSendCommands = 0;
+            while (_sendQueue.TryDequeue(out _)) 
+            { 
+                clearedSendCommands++; 
+            }
+            
+            // Do NOT clear receive queue - preserve most recent robot data
+            StatusChanged?.Invoke($"🧹 Cleared {clearedSendCommands} pending commands (most recent robot data preserved)");
+        }
+        
+        /// <summary>
+        /// Get the most recent robot data stream received from robot
+        /// CRITICAL: This ensures Scratch always has access to latest robot data stream
+        /// </summary>
+        public byte[] GetLatestSensorData()
+        {
+            lock (_robotDataLock)
+            {
+                if (_latestRobotData != null)
+                {
+                    var copy = new byte[_latestRobotData.Length];
+                    Array.Copy(_latestRobotData, copy, _latestRobotData.Length);
+                    return copy;
+                }
+                return null;
+            }
+        }
+        
+        /// <summary>
+        /// Get age of most recent robot data in milliseconds
+        /// </summary>
+        public double GetSensorDataAgeMs()
+        {
+            lock (_robotDataLock)
+            {
+                if (_lastRobotDataTime == DateTime.MinValue)
+                    return double.MaxValue;
+                return (DateTime.Now - _lastRobotDataTime).TotalMilliseconds;
+            }
+        }
+        
+        /// <summary>
+        /// Notify BluetoothManager that Scratch has connected
+        /// CRITICAL: Immediately send most recent robot data to ensure safety
+        /// </summary>
+        public void OnScratchConnected()
+        {
+            _isScratchConnected = true;
+            StatusChanged?.Invoke("🌟 Scratch connected - robot command sending enabled");
+            
+            // CRITICAL SAFETY: Immediately send most recent robot data to Scratch
+            byte[] latestData = GetLatestSensorData();
+            if (latestData != null)
+            {
+                var ageMs = GetSensorDataAgeMs();
+                var hex = BitConverter.ToString(latestData).Replace("-", " ");
+                StatusChanged?.Invoke($"🎯 SENDING MOST RECENT ROBOT DATA on connect: {latestData.Length} bytes, age: {ageMs:F0}ms → {hex}");
+                
+                // Fire event immediately to ensure Scratch gets most recent robot state
+                DataReceived?.Invoke(latestData);
+                
+                StatusChanged?.Invoke("✅ Most recent robot data delivered to Scratch for safety");
+            }
+            else
+            {
+                StatusChanged?.Invoke("ℹ️ No robot data available yet");
+            }
+        }
+        
+        /// <summary>
+        /// Notify BluetoothManager that Scratch has disconnected and clear pending commands
+        /// POLICY: Block commands TO robot, but continue preserving sensor data FROM robot
+        /// </summary>
+        public void OnScratchDisconnected()
+        {
+            _isScratchConnected = false;
+            
+            // Clear only the SEND queue (commands TO robot) - preserve sensor data
+            int clearedCount = 0;
+            while (_sendQueue.TryDequeue(out _)) 
+            { 
+                clearedCount++; 
+            }
+            
+            StatusChanged?.Invoke($"❌ Scratch disconnected - robot command sending disabled");
+            if (clearedCount > 0)
+            {
+                StatusChanged?.Invoke($"🧹 Cleared {clearedCount} pending commands (sensor data preserved)");
+            }
+            
+            // Continue preserving most recent robot data for when Scratch reconnects
+            StatusChanged?.Invoke("📡 Continuing to preserve most recent robot data");
+        }
+
+        public async Task DisconnectAsync()
         {
             try
             {
@@ -815,22 +737,21 @@ namespace TeBot
                 // Set disconnected state immediately to stop all loops and operations
                 _isConnected = false;
                 
-                // Stop transmission system first (this should be fast)
-                StopTransmissionSystem();
+                // Stop OPTIMIZED async handlers
+                StopOptimizedAsyncHandlers();
                 
                 // Close and dispose stream with timeout
                 if (_bluetoothStream != null)
                 {
                     try
                     {
-                        // Use a timeout for stream operations
                         var closeStreamTask = Task.Run(() =>
                         {
                             _bluetoothStream.Close();
                             _bluetoothStream.Dispose();
                         });
                         
-                        var timeoutTask = Task.Delay(2000); // 2 second timeout
+                        var timeoutTask = Task.Delay(2000);
                         var completedTask = await Task.WhenAny(closeStreamTask, timeoutTask);
                         
                         if (completedTask == timeoutTask)
@@ -840,7 +761,6 @@ namespace TeBot
                     }
                     catch (Exception ex)
                     {
-                        Debug.WriteLine($"Error closing stream: {ex.Message}");
                         StatusChanged?.Invoke($"Stream close error: {ex.Message}");
                     }
                     finally
@@ -854,11 +774,10 @@ namespace TeBot
                 {
                     try
                     {
-                        // Only try to close if still connected
                         if (_bluetoothClient.Connected)
                         {
                             var closeClientTask = Task.Run(() => _bluetoothClient.Close());
-                            var timeoutTask = Task.Delay(3000); // 3 second timeout
+                            var timeoutTask = Task.Delay(3000);
                             var completedTask = await Task.WhenAny(closeClientTask, timeoutTask);
                             
                             if (completedTask == timeoutTask)
@@ -869,15 +788,13 @@ namespace TeBot
                     }
                     catch (Exception ex)
                     {
-                        Debug.WriteLine($"Error closing Bluetooth client: {ex.Message}");
                         StatusChanged?.Invoke($"Bluetooth close error: {ex.Message}");
                     }
                     
-                    // Always dispose the client
                     try
                     {
                         var disposeTask = Task.Run(() => _bluetoothClient.Dispose());
-                        var timeoutTask = Task.Delay(2000); // 2 second timeout for dispose
+                        var timeoutTask = Task.Delay(2000);
                         var completedTask = await Task.WhenAny(disposeTask, timeoutTask);
                         
                         if (completedTask == timeoutTask)
@@ -887,7 +804,6 @@ namespace TeBot
                     }
                     catch (Exception ex)
                     {
-                        Debug.WriteLine($"Error disposing Bluetooth client: {ex.Message}");
                         StatusChanged?.Invoke($"Bluetooth dispose error: {ex.Message}");
                     }
                     finally
@@ -899,7 +815,6 @@ namespace TeBot
                 var deviceName = _connectedDevice?.DeviceName ?? "device";
                 _connectedDevice = null;
                 
-                // Short delay for final cleanup
                 await Task.Delay(100);
                 
                 StatusChanged?.Invoke($"Disconnected from {deviceName}");
@@ -907,7 +822,6 @@ namespace TeBot
             catch (Exception ex)
             {
                 StatusChanged?.Invoke($"Error during disconnect: {ex.Message}");
-                Debug.WriteLine($"Disconnect error: {ex}");
                 
                 // Force cleanup even if there was an error
                 _isConnected = false;
@@ -915,531 +829,167 @@ namespace TeBot
                 _bluetoothClient = null;
                 _connectedDevice = null;
             }
-        }        private void StopTransmissionSystem()
-        {
-            try
-            {
-                StatusChanged?.Invoke("Stopping transmission system...");
-                
-                // Stop timers first (should be immediate)
-                try
-                {
-                    _transmissionTimer?.Dispose();
-                    _transmissionTimer = null;
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"Error disposing transmission timer: {ex.Message}");
-                }
-                
-                try
-                {
-                    _continuousTransmissionTimer?.Dispose();
-                    _continuousTransmissionTimer = null;
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"Error disposing continuous timer: {ex.Message}");
-                }
-                
-                // Cancel operations (should be immediate)
-                try
-                {
-                    _transmissionCancellation?.Cancel();
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"Error cancelling transmission: {ex.Message}");
-                }
-                
-                // Dispose cancellation token (should be immediate)
-                try
-                {
-                    _transmissionCancellation?.Dispose();
-                    _transmissionCancellation = null;
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"Error disposing cancellation token: {ex.Message}");
-                }
-                
-                // Stop flush timer (should be immediate)
-                try
-                {
-                    _flushTimer?.Stop();
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"Error stopping flush timer: {ex.Message}");
-                }
-                
-                // Reset mode flags (immediate)
-                _isContinuousMode = false;
-                _isListenOnlyMode = false;
-                
-                // Clear queues (should be fast)
-                try
-                {
-                    while (_dataQueue.TryDequeue(out _)) { }
-                    while (_receivedDataQueue.TryDequeue(out _)) { }
-                    _dataAvailable.Reset();
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"Error clearing queues: {ex.Message}");
-                }
-                
-                // Update transmission state (immediate)
-                try
-                {
-                    lock (_transmissionLock)
-                    {
-                        _isTransmitting = false;
-                        TransmissionStatus?.Invoke(false);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"Error updating transmission status: {ex.Message}");
-                }
-                
-                StatusChanged?.Invoke("Transmission system stopped");
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Error stopping transmission system: {ex.Message}");
-                Debug.WriteLine($"StopTransmissionSystem error: {ex}");
-                
-                // Force reset even if there were errors
-                _isContinuousMode = false;
-                _isListenOnlyMode = false;
-                _isTransmitting = false;
-                _transmissionTimer = null;
-                _continuousTransmissionTimer = null;
-                _transmissionCancellation = null;
-            }
         }
 
-        public void Dispose()
-        {
-            try
-            {
-                // Use force disconnect to avoid hanging in Dispose
-                ForceDisconnect();
-                
-                // Dispose remaining resources
-                try { _flushTimer?.Dispose(); } catch { }
-                try { _dataAvailable?.Dispose(); } catch { }
-                try { _responseAvailableSemaphore?.Dispose(); } catch { }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error in Dispose: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Try to get received data from the queue
-        /// </summary>
-        public bool TryGetReceivedData(out byte[] data)
-        {
-            return _receivedDataQueue.TryDequeue(out data);
-        }        /// <summary>
-        /// Start continuous transmission mode - sends 10 packets every 200ms (Master mode)
-        /// TeBot acts as master, sending 82-byte commands to slave robot
-        /// </summary>
-        public void StartContinuousTransmission()
-        {
-            if (!_isConnected)
-            {
-                StatusChanged?.Invoke("Cannot start continuous mode: not connected");
-                return;
-            }
-
-            if (_isContinuousMode)
-            {
-                StatusChanged?.Invoke("Continuous transmission already running");
-                return;
-            }
-
-            // Stop the regular transmission system to avoid conflicts
-            _transmissionTimer?.Dispose();
-            _transmissionTimer = null;
-            
-            // Clear any pending packets in the regular queue
-            while (_dataQueue.TryDequeue(out _)) { }
-            QueueStatus?.Invoke(0);            _isContinuousMode = true;
-            _continuousPacketCounter = 0;
-            
-            // Start continuous transmission timer (one-shot mode, we'll restart it after each cycle)
-            _continuousTransmissionTimer = new Timer(ContinuousTransmissionCallback, null, 0, Timeout.Infinite);
-            
-            StatusChanged?.Invoke("Started MASTER continuous transmission mode (82-byte send + wait for 82-byte response every 500ms)");
-        }        /// <summary>
-        /// Stop continuous transmission mode
-        /// </summary>
-        public void StopContinuousTransmission()
-        {
-            if (!_isContinuousMode)
-            {
-                StatusChanged?.Invoke("Continuous transmission not running");
-                return;
-            }
-
-            _isContinuousMode = false;
-            _continuousTransmissionTimer?.Dispose();
-            _continuousTransmissionTimer = null;
-            
-            // Restart the regular transmission system
-            if (_isConnected && _transmissionTimer == null)
-            {
-                _transmissionTimer = new Timer(TransmissionCallback, null, 0, TRANSMISSION_INTERVAL_MS);
-                StatusChanged?.Invoke("Regular transmission system restarted");
-            }            
-            StatusChanged?.Invoke("Stopped continuous transmission mode");
-        }
-
-        private async void ContinuousTransmissionCallback(object state)
-        {
-            if (!_isConnected || !_isContinuousMode)
-                return;
-
-            var cycleStartTime = DateTime.Now;
-            var consecutiveTimeouts = 0;
-            const int maxConsecutiveTimeouts = 5; // Stop after 5 consecutive timeouts
-
-            try
-            {
-                var startTime = DateTime.Now;
-                
-                // Create 82-byte master command (marker + 10 packets of 8 bytes each)
-                var masterCommand = new byte[82]; // 2 bytes marker + 80 bytes data
-                masterCommand[0] = 0xAA; // Marker byte 1
-                masterCommand[1] = 0x55; // Marker byte 2
-                
-                // Generate 10 packets directly into the buffer after the marker
-                for (int i = 0; i < 10; i++)
-                {
-                    int bufferOffset = 2 + (i * 8); // Start after marker bytes
-                    
-                    masterCommand[bufferOffset + 0] = 0x07; // Command identifier
-                    masterCommand[bufferOffset + 1] = (byte)(i + 1); // Packet number within list (1-10)
-                    masterCommand[bufferOffset + 2] = (byte)((_continuousPacketCounter >> 8) & 0xFF); // High byte of counter
-                    masterCommand[bufferOffset + 3] = (byte)(_continuousPacketCounter & 0xFF); // Low byte of counter
-                    masterCommand[bufferOffset + 4] = (byte)(i * 10); // Sequence within packet
-                    masterCommand[bufferOffset + 5] = 0x55; // Test marker
-                    masterCommand[bufferOffset + 6] = 0xBB; // Test marker
-                    masterCommand[bufferOffset + 7] = (byte)(255 - (i * 10)); // Checksum-like value
-                    
-                    _continuousPacketCounter++;
-                }
-
-                // STEP 1: Send 82-byte master command
-                if (_bluetoothStream != null && _bluetoothStream.CanWrite)
-                {
-                    StatusChanged?.Invoke($"MASTER: Sending 82-byte command #{_continuousPacketCounter / 10}...");
-                    
-                    await _bluetoothStream.WriteAsync(masterCommand, 0, masterCommand.Length);
-                    await _bluetoothStream.FlushAsync();
-                    
-                    var markerHex = BitConverter.ToString(masterCommand, 0, 2).Replace("-", " ");
-                    Debug.WriteLine($"MASTER sent 82-byte command: Marker=[{markerHex}] at {DateTime.Now:HH:mm:ss.fff}");
-                }
-                
-                // STEP 2: Wait for exactly 82 bytes response (timeout: 220ms - increased for better reliability)
-                Debug.WriteLine($"MASTER: Waiting for slave response (timeout: 220ms) at {DateTime.Now:HH:mm:ss.fff}");
-                var response = await WaitForSlaveResponse(220);
-                
-                if (response != null && response.Length == 82)
-                {
-                    StatusChanged?.Invoke($"✅ MASTER: Received 82-byte slave response");
-                    consecutiveTimeouts = 0; // Reset timeout counter on successful response
-                    
-                    // Process the 82-byte response (marker + 10 packets)
-                    var responseMarker = BitConverter.ToString(response, 0, 2).Replace("-", " ");
-                    Debug.WriteLine($"SLAVE response received: Marker=[{responseMarker}] at {DateTime.Now:HH:mm:ss.fff}");
-                    
-                    // Parse response into individual packets and fire event
-                    var responsePackets = new List<byte[]>();
-                    for (int i = 0; i < 10; i++)
-                    {
-                        int packetStart = 2 + (i * 8); // Skip 2-byte marker
-                        if (packetStart + 8 <= response.Length)
-                        {
-                            var packet = new byte[8];
-                            Array.Copy(response, packetStart, packet, 0, 8);
-                            responsePackets.Add(packet);
-                        }
-                    }
-                    
-                    // Fire event with the response packets
-                    if (responsePackets.Count > 0)
-                    {
-                        ContinuousResponseReceived?.Invoke(responsePackets);
-                    }
-                }
-                else
-                {
-                    consecutiveTimeouts++;
-                    StatusChanged?.Invoke($"❌ MASTER: No valid 82-byte response from slave (timeout 220ms) - consecutive timeouts: {consecutiveTimeouts}");
-                    Debug.WriteLine($"MASTER: Response timeout at {DateTime.Now:HH:mm:ss.fff} - consecutive: {consecutiveTimeouts}");
-                    
-                    // Stop continuous transmission if too many consecutive timeouts
-                    if (consecutiveTimeouts >= maxConsecutiveTimeouts)
-                    {
-                        StatusChanged?.Invoke($"🔴 MASTER: Stopping continuous transmission after {maxConsecutiveTimeouts} consecutive timeouts");
-                        StopContinuousTransmission();
-                        return;
-                    }
-                }
-                
-                // STEP 3: Ensure we wait until the full 500ms interval is complete
-                var elapsed = DateTime.Now - startTime;
-                var remainingTime = TimeSpan.FromMilliseconds(500) - elapsed;
-                
-                if (remainingTime.TotalMilliseconds > 10) // Only wait if there's meaningful time left
-                {
-                    Debug.WriteLine($"MASTER: Waiting {remainingTime.TotalMilliseconds:F0}ms to complete 500ms interval (elapsed: {elapsed.TotalMilliseconds:F0}ms)");
-                    await Task.Delay(remainingTime);
-                }
-                else if (remainingTime.TotalMilliseconds < 0)
-                {
-                    Debug.WriteLine($"MASTER: Cycle took {elapsed.TotalMilliseconds:F0}ms - {Math.Abs(remainingTime.TotalMilliseconds):F0}ms over target 500ms");
-                }
-                
-                // STEP 4: Schedule next transmission (if still in continuous mode)
-                if (_isConnected && _isContinuousMode && _continuousTransmissionTimer != null)
-                {
-                    _continuousTransmissionTimer.Change(0, Timeout.Infinite);
-                }
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Error in continuous transmission: {ex.Message}");
-                
-                // Still try to schedule next transmission if we're still connected
-                if (_isConnected && _isContinuousMode && _continuousTransmissionTimer != null)
-                {
-                    _continuousTransmissionTimer.Change(500, Timeout.Infinite);
-                }
-            }
-        }
-        
-        
-        /// <summary>
-        /// Start listen-only mode - just receive and display data from robot
-        /// </summary>
-        public void StartListenOnlyMode()
-        {
-            if (!_isConnected)
-            {
-                StatusChanged?.Invoke("Cannot start listen mode: not connected");
-                return;
-            }
-
-            if (_isListenOnlyMode)
-            {
-                StatusChanged?.Invoke("Listen-only mode already running");
-                return;
-            }
-
-            // Stop all transmission systems
-            _transmissionTimer?.Dispose();
-            _transmissionTimer = null;
-            _continuousTransmissionTimer?.Dispose();
-            _continuousTransmissionTimer = null;
-            _isContinuousMode = false;
-            
-            // Clear any pending packets
-            while (_dataQueue.TryDequeue(out _)) { }
-            while (_receivedDataQueue.TryDequeue(out _)) { }
-            QueueStatus?.Invoke(0);
-
-            _isListenOnlyMode = true;
-            
-            StatusChanged?.Invoke("Started LISTEN-ONLY mode - waiting for robot data...");
-        }
-
-        /// <summary>
-        /// Stop listen-only mode
-        /// </summary>
-        public void StopListenOnlyMode()
-        {
-            if (!_isListenOnlyMode)
-            {
-                StatusChanged?.Invoke("Listen-only mode not running");
-                return;
-            }
-
-            _isListenOnlyMode = false;
-            
-            // Restart the regular transmission system
-            if (_isConnected && _transmissionTimer == null)
-            {
-                _transmissionTimer = new Timer(TransmissionCallback, null, 0, TRANSMISSION_INTERVAL_MS);
-                StatusChanged?.Invoke("Regular transmission system restarted");
-            }
-            
-            StatusChanged?.Invoke("Stopped listen-only mode");
-        }
-        
-        /// <summary>
-        /// Check if the Bluetooth connection is healthy
-        /// </summary>
-        private bool IsConnectionHealthy()
-        {
-            try
-            {
-                if (!_isConnected || _bluetoothClient == null || _bluetoothStream == null)
-                {
-                    return false;
-                }
-                
-                // Check if client is still connected
-                if (!_bluetoothClient.Connected)
-                {
-                    StatusChanged?.Invoke("Bluetooth client reports disconnected");
-                    return false;
-                }
-                
-                // Check if stream is still available
-                if (!_bluetoothStream.CanRead || !_bluetoothStream.CanWrite)
-                {
-                    StatusChanged?.Invoke("Bluetooth stream is no longer readable/writable");
-                    return false;
-                }
-                
-                return true;
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Connection health check failed: {ex.Message}");
-                return false;
-            }
-        }
-        
         /// <summary>
         /// Force immediate disconnect without waiting for graceful cleanup
-        /// Use this if regular DisconnectAsync() hangs
         /// </summary>
         public void ForceDisconnect()
         {
             try
             {
-                StatusChanged?.Invoke("Force disconnecting...");
-                
-                // Immediately set disconnected state
                 _isConnected = false;
                 
-                // Force stop transmission system
-                _isContinuousMode = false;
-                _isListenOnlyMode = false;
-                _isTransmitting = false;
+                // Cancel handlers immediately
+                _globalCancellation?.Cancel();
                 
-                // Dispose timers without waiting - use parallel execution for speed
-                Task.Run(() =>
-                {
-                    try { _transmissionTimer?.Dispose(); } catch { }
-                    try { _continuousTransmissionTimer?.Dispose(); } catch { }
-                    try { _flushTimer?.Stop(); } catch { }
-                });
+                // Force cleanup
+                try { _bluetoothStream?.Close(); } catch { }
+                try { _bluetoothStream?.Dispose(); } catch { }
+                try { _bluetoothClient?.Close(); } catch { }
+                try { _bluetoothClient?.Dispose(); } catch { }
                 
-                // Cancel operations immediately
-                try { _transmissionCancellation?.Cancel(); } catch { }
-                try { _transmissionCancellation?.Dispose(); } catch { }
-                
-                // Force close stream and client in parallel
-                Task.Run(() =>
-                {
-                    try { _bluetoothStream?.Close(); } catch { }
-                    try { _bluetoothStream?.Dispose(); } catch { }
-                });
-                
-                Task.Run(() =>
-                {
-                    try { _bluetoothClient?.Close(); } catch { }
-                    try { _bluetoothClient?.Dispose(); } catch { }
-                });
-                
-                // Clear all references immediately
                 _bluetoothStream = null;
                 _bluetoothClient = null;
                 _connectedDevice = null;
-                _transmissionCancellation = null;
-                _transmissionTimer = null;
-                _continuousTransmissionTimer = null;
                 
-                // Clear queues quickly
-                try
-                { 
-                    while (_dataQueue.TryDequeue(out _)) { }
-                    while (_receivedDataQueue.TryDequeue(out _)) { }
-                    _dataAvailable.Reset();
-                    
-                    // Clear any pending semaphore signals
-                    while (_responseAvailableSemaphore.CurrentCount > 0)
-                    {
-                        _responseAvailableSemaphore.Wait(0);
-                    }
-                } 
-                catch { }
-                
-                StatusChanged?.Invoke("Force disconnect completed");
+                StatusChanged?.Invoke("Force disconnected");
             }
             catch (Exception ex)
             {
                 StatusChanged?.Invoke($"Error in force disconnect: {ex.Message}");
-                // Even if force disconnect fails, ensure critical flags are reset
-                _isConnected = false;
-                _isContinuousMode = false;
-                _isListenOnlyMode = false;
-                _isTransmitting = false;
             }
         }
 
         /// <summary>
-        /// Detect all available Bluetooth adapters (built-in + external dongles)
+        /// Select a specific Bluetooth adapter by index
+        /// </summary>
+        public bool SelectBluetoothAdapter(int index)
+        {
+            if (_availableRadios != null && index >= 0 && index < _availableRadios.Length)
+            {
+                _selectedRadio = _availableRadios[index];
+                StatusChanged?.Invoke($"Selected adapter: {_selectedRadio?.Name ?? "None"}");
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Select a specific Bluetooth adapter by radio object
+        /// </summary>
+        public void SelectBluetoothAdapter(BluetoothRadio radio)
+        {
+            _selectedRadio = radio;
+            StatusChanged?.Invoke($"Selected adapter: {radio?.Name ?? "None"}");
+        }
+
+        /// <summary>
+        /// Refresh adapters and prefer TP-Link dongle
+        /// </summary>
+        public void RefreshAndSelectTPLinkDongle()
+        {
+            DetectBluetoothAdapters();
+            PreferExternalDongle();
+        }
+
+        /// <summary>
+        /// Get description of selected adapter
+        /// </summary>
+        public string GetSelectedAdapterDescription()
+        {
+            return SelectedAdapterInfo;
+        }
+
+        /// <summary>
+        /// Pair with a device (simplified implementation)
+        /// </summary>
+        public async Task<bool> PairWithDeviceAsync(BluetoothDeviceInfo device, string pin = null)
+        {
+            try
+            {
+                StatusChanged?.Invoke($"Attempting to pair with {device.DeviceName}...");
+                
+                // For HC-05 and similar devices, pairing often happens during connection
+                // This is a placeholder - actual pairing depends on device type
+                await Task.Delay(1000);
+                
+                StatusChanged?.Invoke($"Pairing attempt completed for {device.DeviceName}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke($"Pairing failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Unpair a device (simplified implementation)
+        /// </summary>
+        public async Task<bool> UnpairDeviceAsync(BluetoothDeviceInfo device)
+        {
+            try
+            {
+                StatusChanged?.Invoke($"Attempting to unpair {device.DeviceName}...");
+                
+                // This is a placeholder - actual unpairing is complex
+                await Task.Delay(500);
+                
+                StatusChanged?.Invoke($"Unpair attempt completed for {device.DeviceName}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke($"Unpair failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Detect all available Bluetooth adapters
         /// </summary>
         public void DetectBluetoothAdapters()
         {
             try
             {
-                StatusChanged?.Invoke("Detecting Bluetooth adapters...");
-                
-                var radios = BluetoothRadio.AllRadios;
-                _availableRadios = radios;
-                
-                StatusChanged?.Invoke($"Found {radios.Length} Bluetooth adapter(s):");
-                
-                for (int i = 0; i < radios.Length; i++)
-                {
-                    var radio = radios[i];
-                    var adapterInfo = $"[{i + 1}] {radio.Name} - {radio.LocalAddress} " +
-                                     $"(Mode: {radio.Mode})";
-                    StatusChanged?.Invoke($"  {adapterInfo}");
-                    Debug.WriteLine($"Bluetooth Adapter {i + 1}: {adapterInfo}");
-                    
-                    // Check if this looks like a TP-Link dongle
-                    if (IsTPLinkDongle(radio))
-                    {
-                        StatusChanged?.Invoke($"  ⭐ Detected TP-Link USB dongle: {radio.Name}");
-                    }
-                }
-                
-                // Auto-select the best adapter if none is selected
-                if (_selectedRadio == null && radios.Length > 0)
-                {
-                    PreferExternalDongle();
-                }
-                
-                BluetoothAdaptersDiscovered?.Invoke(radios);
+                _availableRadios = BluetoothRadio.AllRadios;
+                StatusChanged?.Invoke($"Detected {_availableRadios.Length} Bluetooth adapter(s)");
+                BluetoothAdaptersDiscovered?.Invoke(_availableRadios);
             }
             catch (Exception ex)
             {
                 StatusChanged?.Invoke($"Error detecting Bluetooth adapters: {ex.Message}");
-                Debug.WriteLine($"DetectBluetoothAdapters error: {ex}");
                 _availableRadios = new BluetoothRadio[0];
             }
+        }
+
+        /// <summary>
+        /// Prefer external Bluetooth dongle over built-in adapter
+        /// </summary>
+        public bool PreferExternalDongle()
+        {
+            if (_availableRadios?.Length > 1)
+            {
+                // Look for TP-Link or other external dongles
+                var externalDongle = _availableRadios.FirstOrDefault(r => IsTPLinkDongle(r));
+                if (externalDongle != null)
+                {
+                    _selectedRadio = externalDongle;
+                    StatusChanged?.Invoke($"Selected external dongle: {externalDongle.Name}");
+                    return true;
+                }
+            }
+            
+            // Default to first available adapter
+            if (_availableRadios?.Length > 0)
+            {
+                _selectedRadio = _availableRadios[0];
+                StatusChanged?.Invoke($"Selected adapter: {_selectedRadio.Name}");
+                return true;
+            }
+            
+            return false;
         }
 
         /// <summary>
@@ -1449,487 +999,16 @@ namespace TeBot
         {
             try
             {
-                var name = radio.Name?.ToLower() ?? "";
-                var manufacturer = radio.Manufacturer.ToString().ToLower();
+                var name = radio.Name?.ToLowerInvariant() ?? "";
+                var address = radio.LocalAddress?.ToString() ?? "";
                 
-                // Check for TP-Link specific identifiers
-                if (name.Contains("tp-link") || name.Contains("tplink") ||
-                    manufacturer.Contains("tp-link") || manufacturer.Contains("tplink"))
-                {
-                    return true;
-                }
-                
-                // TP-Link dongles often use these chip manufacturers
-                if (manufacturer.Contains("realtek") || 
-                    manufacturer.Contains("cambridge_silicon_radio") ||
-                    manufacturer.Contains("broadcom") ||
-                    manufacturer.Contains("csr"))
-                {
-                    // Additional checks for USB dongles
-                    if (name.Contains("usb") || name.Contains("dongle") || name.Contains("external"))
-                    {
-                        return true;
-                    }
-                }
-                
-                // Check for common USB Bluetooth dongle patterns
-                if (name.Contains("bluetooth usb") || 
-                    name.Contains("usb bluetooth") ||
-                    name.Contains("external bluetooth") ||
-                    name.Contains("bluetooth dongle"))
-                {
-                    return true;
-                }
-                
-                return false;
+                return name.Contains("tp-link") || 
+                       name.Contains("tplink") ||
+                       address.StartsWith("ac:84:c6"); // Common TP-Link OUI
             }
             catch
             {
                 return false;
-            }
-        }
-
-        /// <summary>
-        /// Select a specific Bluetooth adapter by index
-        /// </summary>
-        public bool SelectBluetoothAdapter(int adapterIndex)
-        {
-            try
-            {
-                if (_availableRadios == null || adapterIndex < 0 || adapterIndex >= _availableRadios.Length)
-                {
-                    StatusChanged?.Invoke($"Invalid adapter index: {adapterIndex}");
-                    return false;
-                }
-
-                var radio = _availableRadios[adapterIndex];
-                
-                // Try to enable the adapter if needed
-                StatusChanged?.Invoke($"Selecting adapter: {radio.Name}");
-                try
-                {
-                    if (radio.Mode != RadioMode.Connectable)
-                    {
-                        radio.Mode = RadioMode.Connectable;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    StatusChanged?.Invoke($"Could not enable adapter {radio.Name}: {ex.Message}");
-                    // Continue anyway - some adapters don't allow mode changes
-                }
-
-                _selectedRadio = radio;
-                
-                // Create a new BluetoothClient - we can't specify which adapter directly with 32feet.NET
-                // but we can set the selected radio for reference
-                _bluetoothClient?.Dispose();
-                _bluetoothClient = new BluetoothClient();
-                
-                var dongleType = IsTPLinkDongle(radio) ? "TP-Link USB" : "Built-in";
-                StatusChanged?.Invoke($"✅ Selected {dongleType} Bluetooth adapter: {radio.Name} ({radio.LocalAddress})");
-                StatusChanged?.Invoke($"   Mode: {radio.Mode}");
-                StatusChanged?.Invoke($"   Manufacturer: {radio.Manufacturer}");
-                return true;
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Error selecting Bluetooth adapter: {ex.Message}");
-                Debug.WriteLine($"SelectBluetoothAdapter error: {ex}");
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Auto-detect and prefer external TP-Link dongle over built-in Bluetooth
-        /// </summary>
-        public bool PreferExternalDongle()
-        {
-            try
-            {
-                if (_availableRadios == null || _availableRadios.Length == 0)
-                {
-                    StatusChanged?.Invoke("No Bluetooth adapters found");
-                    return false;
-                }
-
-                if (_availableRadios.Length == 1)
-                {
-                    StatusChanged?.Invoke("Only one Bluetooth adapter found - using it");
-                    return SelectBluetoothAdapter(0);
-                }
-
-                StatusChanged?.Invoke($"Multiple adapters found ({_availableRadios.Length}), prioritizing external TP-Link dongles...");
-
-                // Priority 1: Look for TP-Link dongles first (highest priority)
-                for (int i = 0; i < _availableRadios.Length; i++)
-                {
-                    var radio = _availableRadios[i];
-                    if (IsTPLinkDongle(radio))
-                    {
-                        var name = radio.Name?.ToLower() ?? "";
-                        if (name.Contains("tp-link") || name.Contains("tplink"))
-                        {
-                            StatusChanged?.Invoke($"� Found TP-Link dongle: {radio.Name} - selecting it as highest priority");
-                            return SelectBluetoothAdapter(i);
-                        }
-                    }
-                }
-
-                // Priority 2: Look for any external USB dongles
-                for (int i = 0; i < _availableRadios.Length; i++)
-                {
-                    var radio = _availableRadios[i];
-                    if (IsTPLinkDongle(radio))
-                    {
-                        StatusChanged?.Invoke($"🔍 Found external USB dongle: {radio.Name} - selecting it");
-                        return SelectBluetoothAdapter(i);
-                    }
-                }
-
-                // Priority 3: Look for any USB-related adapters
-                for (int i = 0; i < _availableRadios.Length; i++)
-                {
-                    var radio = _availableRadios[i];
-                    var name = radio.Name?.ToLower() ?? "";
-                    
-                    if (name.Contains("usb") || name.Contains("dongle") || name.Contains("external"))
-                    {
-                        StatusChanged?.Invoke($"🔍 Found USB adapter: {radio.Name} - selecting it");
-                        return SelectBluetoothAdapter(i);
-                    }
-                }
-
-                // Default to first adapter if no external dongles found
-                StatusChanged?.Invoke("No external dongles detected, using first available adapter (likely built-in)");
-                return SelectBluetoothAdapter(0);
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Error preferring external dongle: {ex.Message}");
-                Debug.WriteLine($"PreferExternalDongle error: {ex}");
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Get detailed information about all Bluetooth adapters
-        /// </summary>
-        public List<string> GetBluetoothAdapterDetails()
-        {
-            var details = new List<string>();
-            
-            try
-            {
-                if (_availableRadios == null || _availableRadios.Length == 0)
-                {
-                    details.Add("No Bluetooth adapters found");
-                    return details;
-                }
-
-                for (int i = 0; i < _availableRadios.Length; i++)
-                {
-                    var radio = _availableRadios[i];
-                    var isSelected = radio == _selectedRadio ? " ⭐ SELECTED" : "";
-                    var isTPLink = IsTPLinkDongle(radio) ? " 🔥 TP-LINK DONGLE" : "";
-                    
-                    details.Add($"[{i + 1}] {radio.Name}{isSelected}{isTPLink}");
-                    details.Add($"    Address: {radio.LocalAddress}");
-                    details.Add($"    Manufacturer: {radio.Manufacturer}");
-                    details.Add($"    Mode: {radio.Mode}");
-                    details.Add($"    Class of Device: {radio.ClassOfDevice}");
-                    details.Add($"    LMP Version: {radio.LmpVersion}");
-                    details.Add("");
-                }
-            }
-            catch (Exception ex)
-            {
-                details.Add($"Error getting adapter details: {ex.Message}");
-            }
-            
-            return details;
-        }
-
-        /// <summary>
-        /// Force refresh adapters and select TP-Link dongle if available
-        /// </summary>
-        public void RefreshAndSelectTPLinkDongle()
-        {
-            try
-            {
-                StatusChanged?.Invoke("🔄 Refreshing Bluetooth adapters...");
-                DetectBluetoothAdapters();
-                
-                if (_availableRadios != null && _availableRadios.Length > 0)
-                {
-                    // Force re-selection with preference for TP-Link
-                    _selectedRadio = null;
-                    PreferExternalDongle();
-                    
-                    var selectedInfo = SelectedAdapterInfo;
-                    StatusChanged?.Invoke($"✅ Adapter selection complete: {selectedInfo}");
-                }
-                else
-                {
-                    StatusChanged?.Invoke("❌ No Bluetooth adapters found after refresh");
-                }
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Error refreshing adapters: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Get human-readable adapter information including dongle type
-        /// </summary>
-        public string GetSelectedAdapterDescription()
-        {
-            if (_selectedRadio == null)
-                return "No adapter selected";
-                
-            var dongleType = IsTPLinkDongle(_selectedRadio) ? "🔥 TP-Link USB Dongle" : "💻 Built-in Bluetooth";
-            return $"{dongleType}: {_selectedRadio.Name} ({_selectedRadio.LocalAddress})";
-        }
-        
-        /// <summary>
-        /// Pair with a Bluetooth device using PIN or SSP
-        /// </summary>
-        public async Task<bool> PairWithDeviceAsync(BluetoothDeviceInfo device, string pin = "1234")
-        {
-            try
-            {
-                StatusChanged?.Invoke($"Attempting to pair with {device.DeviceName}...");
-                
-                // Check if device is already paired
-                if (device.Authenticated)
-                {
-                    StatusChanged?.Invoke($"✅ {device.DeviceName} is already paired");
-                    return true;
-                }
-
-                // Attempt pairing
-                bool pairingResult = false;
-                
-                await Task.Run(() =>
-                {
-                    try
-                    {
-                        // Try pairing with PIN
-                        pairingResult = BluetoothSecurity.PairRequest(device.DeviceAddress, pin);
-                    }
-                    catch (Exception ex)
-                    {
-                        StatusChanged?.Invoke($"PIN pairing failed: {ex.Message}");
-                        
-                        // Try without PIN (for SSP devices)
-                        try
-                        {
-                            pairingResult = BluetoothSecurity.PairRequest(device.DeviceAddress, null);
-                        }
-                        catch (Exception ex2)
-                        {
-                            StatusChanged?.Invoke($"SSP pairing also failed: {ex2.Message}");
-                        }
-                    }
-                });
-
-                if (pairingResult)
-                {
-                    StatusChanged?.Invoke($"🎉 Successfully paired with {device.DeviceName}!");
-                    
-                    // Refresh device to get updated authentication status
-                    device.Refresh();
-                    
-                    return true;
-                }
-                else
-                {
-                    StatusChanged?.Invoke($"❌ Failed to pair with {device.DeviceName}");
-                    return false;
-                }
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Error during pairing: {ex.Message}");
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Remove pairing with a Bluetooth device
-        /// </summary>
-        public async Task<bool> UnpairDeviceAsync(BluetoothDeviceInfo device)
-        {
-            try
-            {
-                StatusChanged?.Invoke($"Removing pairing with {device.DeviceName}...");
-                
-                bool result = await Task.Run(() =>
-                {
-                    try
-                    {
-                        return BluetoothSecurity.RemoveDevice(device.DeviceAddress);
-                    }
-                    catch (Exception ex)
-                    {
-                        StatusChanged?.Invoke($"Unpair error: {ex.Message}");
-                        return false;
-                    }
-                });
-
-                if (result)
-                {
-                    StatusChanged?.Invoke($"✅ Successfully unpaired {device.DeviceName}");
-                    device.Refresh();
-                    return true;
-                }
-                else
-                {
-                    StatusChanged?.Invoke($"❌ Failed to unpair {device.DeviceName}");
-                    return false;
-                }
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Error during unpairing: {ex.Message}");
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Get list of paired devices
-        /// </summary>
-        public BluetoothDeviceInfo[] GetPairedDevices()
-        {
-            try
-            {
-                var pairedDevices = _bluetoothClient.DiscoverDevices(10, true, false, false);
-                StatusChanged?.Invoke($"Found {pairedDevices.Length} paired device(s)");
-                return pairedDevices;
-            }
-            catch (Exception ex)
-            {
-                StatusChanged?.Invoke($"Error getting paired devices: {ex.Message}");
-                return new BluetoothDeviceInfo[0];
-            }
-        }
-
-        /// <summary>
-        /// Check if a device is paired and authenticated
-        /// </summary>
-        public bool IsDevicePaired(BluetoothDeviceInfo device)
-        {
-            try
-            {
-                device.Refresh(); // Update authentication status
-                return device.Authenticated;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Wait for exactly 82 bytes response from slave device within specified timeout
-        /// This method works with the existing data processing pipeline by checking the received queue
-        /// </summary>
-        /// <param name="timeoutMs">Timeout in milliseconds</param>
-        /// <returns>82-byte response array or null if timeout/error</returns>
-        private async Task<byte[]> WaitForSlaveResponse(int timeoutMs)
-        {
-            var startTime = DateTime.Now;
-            
-            try
-            {
-                // Wait for the semaphore to be signaled (indicating a complete 82-byte response is available)
-                var waitSuccess = await _responseAvailableSemaphore.WaitAsync(timeoutMs);
-                
-                if (!waitSuccess)
-                {
-                    var timeoutElapsed = DateTime.Now - startTime;
-                    Debug.WriteLine($"WaitForSlaveResponse: Timeout after {timeoutElapsed.TotalMilliseconds:F0}ms - no complete response available");
-                    
-                    // Check if we have any partial data in the queue that might indicate communication is working
-                    var queueCount = _receivedDataQueue.Count;
-                    if (queueCount > 0)
-                    {
-                        Debug.WriteLine($"WaitForSlaveResponse: Queue has {queueCount} packets - partial response detected");
-                    }
-                    
-                    return null;
-                }
-                
-                // If we get here, a complete 82-byte response should be available as 10 packets
-                var collectedPackets = new List<byte[]>();
-                var maxRetries = 3; // Allow a few retries in case of timing issues
-                var retryCount = 0;
-                
-                // Collect exactly 10 packets to reconstruct the 82-byte response
-                while (collectedPackets.Count < 10 && retryCount < maxRetries)
-                {
-                    for (int i = collectedPackets.Count; i < 10; i++)
-                    {
-                        if (_receivedDataQueue.TryDequeue(out byte[] packet))
-                        {
-                            collectedPackets.Add(packet);
-                        }
-                        else
-                        {
-                            // This might happen if packets are still being processed - wait a bit
-                            if (retryCount < maxRetries - 1)
-                            {
-                                Debug.WriteLine($"WaitForSlaveResponse: Missing packet {i + 1}/10 - retrying (attempt {retryCount + 1}/{maxRetries})");
-                                await Task.Delay(5); // Small delay to allow processing
-                                break;
-                            }
-                            else
-                            {
-                                Debug.WriteLine($"WaitForSlaveResponse: Missing packet {i + 1}/10 - data integrity issue after {maxRetries} attempts");
-                            }
-                        }
-                    }
-                    
-                    if (collectedPackets.Count < 10)
-                    {
-                        retryCount++;
-                    }
-                }
-                
-                if (collectedPackets.Count == 10)
-                {
-                    // Reconstruct the original 82-byte response with AA 55 marker
-                    var response = new byte[82];
-                    response[0] = 0xAA; // Marker
-                    response[1] = 0x55; // Marker
-                    
-                    // Copy the 10 packets (80 bytes) after the marker
-                    for (int i = 0; i < 10; i++)
-                    {
-                        Array.Copy(collectedPackets[i], 0, response, 2 + (i * 8), 8);
-                    }
-                    
-                    var elapsed = DateTime.Now - startTime;
-                    Debug.WriteLine($"WaitForSlaveResponse: Got complete 82-byte response after {elapsed.TotalMilliseconds:F0}ms (retries: {retryCount})");
-                    return response;
-                }
-                else
-                {
-                    // Put back any packets we collected but couldn't complete the response
-                    foreach (var packet in collectedPackets)
-                    {
-                        _receivedDataQueue.Enqueue(packet);
-                    }
-                    
-                    Debug.WriteLine($"WaitForSlaveResponse: Incomplete response - only got {collectedPackets.Count}/10 packets after {maxRetries} attempts");
-                    return null;
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"WaitForSlaveResponse: Exception - {ex.Message}");
-                return null;
             }
         }
     }

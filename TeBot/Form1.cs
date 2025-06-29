@@ -16,7 +16,6 @@ namespace TeBot
     {
         private WebSocketDataServer _webSocketServer;
         private BluetoothManager _bluetoothManager;
-        private int _dataPacketsSent = 0;
 
         public Form1()
         {
@@ -56,33 +55,21 @@ namespace TeBot
             {
                 if (_bluetoothManager.IsConnected)
                 {
-                    // Log what we received from Scratch
-                    var scratchHex = BitConverter.ToString(data).Replace("-", " ");
-                    UpdateStatus($"📨 Received {data.Length} bytes from Scratch: {scratchHex}");
-                    
-                    // Remove leading zero if present (fix the extra 00 byte issue)
-                    byte[] cleanData = data;
-                    if (data.Length > 0 && data[0] == 0x00)
-                    {
-                        cleanData = new byte[data.Length - 1];
-                        Array.Copy(data, 1, cleanData, 0, data.Length - 1);
-                        var cleanHex = BitConverter.ToString(cleanData).Replace("-", " ");
-                        UpdateStatus($"🔧 Removed leading zero. Sending: {cleanHex}");
-                    }
-                    
-                    // Send command to robot
-                    bool success = await _bluetoothManager.SendDataImmediately(cleanData);
-                    
+                    // Convert the received bytes to a string (assuming UTF-8 or ASCII encoding)
+                    string hexString = Encoding.UTF8.GetString(data); // or Encoding.ASCII.GetString(data)
+                    UpdateStatus($"� Received hex string from Scratch: {hexString}");
+
+                    // Send the hex string directly
+                    bool success = await _bluetoothManager.SendDataImmediately(hexString);
+
                     if (success)
                     {
                         UpdateStatus($"✅ Command sent to robot successfully");
-                        
-                        // IMPORTANT: Add delay to give robot time to process before next command
                         await Task.Delay(100); // 100ms delay between commands
                     }
                     else
                     {
-                        UpdateStatus($"❌ Failed to forward data to robot");
+                        UpdateStatus($"❌ Failed to send command to robot");
                     }
                 }
                 else
@@ -100,12 +87,18 @@ namespace TeBot
         {
             UpdateStatus($"🌟 Scratch connected (Session: {sessionId})");
             UpdateStatus($"   WebSocket server can now send data to Scratch");
+            
+            // Notify BluetoothManager that Scratch is connected
+            _bluetoothManager?.OnScratchConnected();
         }
 
         private void OnScratchDisconnected(string sessionId)
         {
             UpdateStatus($"❌ Scratch disconnected (Session: {sessionId})");
             UpdateStatus($"   Robot data will not reach Scratch until reconnected");
+            
+            // Notify BluetoothManager that Scratch is disconnected and clear pending commands
+            _bluetoothManager?.OnScratchDisconnected();
         }
 
         private void OnBluetoothStatusChanged(string status)
@@ -260,22 +253,23 @@ namespace TeBot
             {
                 btnScanDevices.Enabled = true;
             }
-        }        private async void btnConnect_Click(object sender, EventArgs e)
+        }       
+         private async void btnConnect_Click(object sender, EventArgs e)
         {
             var selectedItem = cmbDevices.SelectedItem as BluetoothDeviceItem;
             var selectedDevice = selectedItem?.Device;
-            
+
             if (selectedDevice == null)
             {
                 UpdateStatus("❌ Please select a device to connect to.");
                 return;
             }
-            
+
             try
             {
                 // Disable buttons during connection attempt
                 btnConnect.Enabled = false;
-                
+
                 bool success = await _bluetoothManager.ConnectToDeviceAsync(selectedDevice);
                 if (success)
                 {
@@ -752,6 +746,9 @@ namespace TeBot
         {
             try
             {
+                // CRITICAL DEBUG: Confirm event was received
+                UpdateStatus($"🚨 FORM1: OnRobotDataReceived() called with {robotData.Length} bytes");
+                
                 var robotHex = BitConverter.ToString(robotData).Replace("-", " ");
                 UpdateStatus($"🤖 Received {robotData.Length} bytes from robot: {robotHex}");
                 
