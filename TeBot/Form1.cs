@@ -39,6 +39,8 @@ namespace TeBot
             _bluetoothManager.DevicesDiscovered += OnDevicesDiscovered;
             _bluetoothManager.DataReceived += OnRobotDataReceived; // Forward robot data to Scratch
             _bluetoothManager.BluetoothAdaptersDiscovered += OnBluetoothAdaptersDiscovered;
+            // Subscribe to JSON-RPC status push event
+            _bluetoothManager.StatusJsonPushed += OnStatusJsonPushed;
 
             // Initialize adapter UI
             LoadBluetoothAdapters();
@@ -53,28 +55,48 @@ namespace TeBot
         {
             try
             {
-                if (_bluetoothManager.IsConnected)
+                // Try to parse as JSON-RPC (assume UTF-8)
+                string msg = Encoding.UTF8.GetString(data).Trim();
+                if (string.IsNullOrWhiteSpace(msg)) return;
+
+                // Try parse as JSON
+                dynamic json = null;
+                try { json = Newtonsoft.Json.JsonConvert.DeserializeObject(msg); } catch { }
+
+                if (json != null && json.jsonrpc != null)
                 {
-                    // Convert the received bytes to a string (assuming UTF-8 or ASCII encoding)
-                    string hexString = Encoding.UTF8.GetString(data); // or Encoding.ASCII.GetString(data)
-                    UpdateStatus($"� Received hex string from Scratch: {hexString}");
-
-                    // Send the hex string directly
-                    bool success = await _bluetoothManager.SendDataImmediately(hexString);
-
-                    if (success)
+                    // Use the new JSON-RPC handler in BluetoothManager
+                    string response = await _bluetoothManager.HandleJsonRpcRequest(msg);
+                    if (!string.IsNullOrEmpty(response))
                     {
-                        UpdateStatus($"✅ Command sent to robot successfully");
-                        await Task.Delay(100); // 100ms delay between commands
+                        // Send the response back via WebSocket as TEXT, not binary (response already has newline)
+                        await _webSocketServer.SendTextToAllClientsAsync(response);
+                        UpdateStatus($"[JSON-RPC] Request processed and response sent");
                     }
-                    else
-                    {
-                        UpdateStatus($"❌ Failed to send command to robot");
-                    }
+                    return;
                 }
                 else
                 {
-                    UpdateStatus("❌ Received Scratch data but robot not connected");
+                    // Fallback: try as legacy hex string (for backward compatibility)
+                    if (_bluetoothManager.IsConnected)
+                    {
+                        string hexString = msg;
+                        UpdateStatus($"� Received hex string from Scratch: {hexString}");
+                        bool success = await _bluetoothManager.SendDataImmediately(hexString);
+                        if (success)
+                        {
+                            UpdateStatus($"✅ Command sent to robot successfully");
+                            await Task.Delay(100); // 100ms delay between commands
+                        }
+                        else
+                        {
+                            UpdateStatus($"❌ Failed to send command to robot");
+                        }
+                    }
+                    else
+                    {
+                        UpdateStatus("❌ Received Scratch data but robot not connected");
+                    }
                 }
             }
             catch (Exception ex)
@@ -741,59 +763,50 @@ namespace TeBot
         }
 
         /// <summary>
-        /// Handle robot data with immediate forwarding to Scratch - simple bridge
+        /// Handle robot data from Bluetooth - DO NOT forward binary data to Scratch
+        /// JSON-RPC formatting is now handled by the StatusJsonPushed event
         /// </summary>
         private async void OnRobotDataReceived(byte[] robotData)
         {
             try
             {
-                // CRITICAL DEBUG: Confirm event was received
-                UpdateStatus($"🚨 FORM1: OnRobotDataReceived() called with {robotData.Length} bytes");
+                // IMPORTANT: DO NOT send binary data to Scratch
+                // Only JSON-RPC formatted messages should be sent to Scratch via OnStatusJsonPushed
                 
-                var robotHex = BitConverter.ToString(robotData).Replace("-", " ");
-                UpdateStatus($"🤖 Received {robotData.Length} bytes from robot: {robotHex}");
+                // We keep this method to continue receiving the data internally
+                // But we don't forward the binary data to Scratch anymore
                 
-                // Check if this is a sensor response packet (starts with 0x10)
-                bool isSensorResponse = robotData.Length >= 1 && robotData[0] == 0x10;
-                
-                if (isSensorResponse)
+                // For debugging purposes only - log this occasionally (not on every packet)
+                if (robotData != null && robotData.Length == 16 && robotData[0] == 0x00 && 
+                    DateTime.Now.Second % 10 == 0) // Only log once every ~10 seconds
                 {
-                    UpdateStatus($"🎯 SENSOR DATA - forwarding immediately to Scratch");
-                }
-                else
-                {
-                    UpdateStatus($"📋 OTHER DATA - forwarding to Scratch");
-                }
-                
-                // Check if WebSocket server is running and has clients
-                if (_webSocketServer == null)
-                {
-                    UpdateStatus($"❌ WebSocket server is null - cannot send data");
-                    return;
-                }
-                
-                UpdateStatus($"📡 Attempting to send {robotData.Length} bytes to WebSocket clients...");
-                
-                try
-                {
-                    // Send ALL robot data immediately to Scratch (simplified approach)
-                    await _webSocketServer.SendToAllClientsAsync(robotData);
-                    UpdateStatus($"✅ Robot data forwarded to Scratch: {robotHex}");
-                }
-                catch (Exception wsEx)
-                {
-                    UpdateStatus($"❌ WebSocket send failed: {wsEx.Message}");
-                    UpdateStatus($"   Exception type: {wsEx.GetType().Name}");
-                    if (wsEx.InnerException != null)
-                    {
-                        UpdateStatus($"   Inner exception: {wsEx.InnerException.Message}");
-                    }
+                    var hexString = BitConverter.ToString(robotData).Replace("-", " ");
+                    Debug.WriteLine($"[DATA] Robot data received: {hexString}");
                 }
             }
-            catch (Exception ex)
+            catch (Exception)
             {
-                UpdateStatus($"❌ Error in OnRobotDataReceived: {ex.Message}");
-                UpdateStatus($"   Exception type: {ex.GetType().Name}");
+                // Suppress all errors to avoid excessive debug output
+            }
+        }
+
+        /// <summary>
+        /// Handle JSON-RPC status push from BluetoothManager and forward to Scratch
+        /// </summary>
+        private async void OnStatusJsonPushed(string statusJson)
+        {
+            try
+            {
+                if (_webSocketServer != null)
+                {
+                    // Send as text (Scratch expects JSON line)
+                    // NOTE: The newline is already added by BluetoothManager.StatusJsonPushed
+                    await _webSocketServer.SendTextToAllClientsAsync(statusJson);
+                }
+            }
+            catch (Exception)
+            {
+                // Suppress all errors to avoid excessive debug output
             }
         }
     }

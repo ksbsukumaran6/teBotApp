@@ -209,6 +209,48 @@ namespace TeBot
             
             return Task.CompletedTask;
         }
+        
+        /// <summary>
+        /// Send text data to all connected WebSocket clients
+        /// This method specifically sends data as WebSocket text frames (not binary frames)
+        /// which is important for JSON-RPC messages that Scratch expects as text
+        /// </summary>
+        /// <param name="textData">The text data to send</param>
+        /// <returns>Task representing the async operation</returns>
+        public Task SendTextToAllClientsAsync(string textData)
+        {
+            if (!_isRunning || _server == null)
+            {
+                Debug.WriteLine("Cannot send text data: server is not running");
+                return Task.CompletedTask;
+            }
+
+            try
+            {
+                var service = _server.WebSocketServices["/"];
+                if (service?.Sessions?.Count > 0)
+                {
+                    Debug.WriteLine($"Attempting to send {textData.Length} chars as TEXT to {service.Sessions.Count} connected clients");
+                    
+                    // Send as text frames instead of binary frames
+                    service.Sessions.Broadcast(textData);
+                    
+                    // Only log the first 100 characters to avoid cluttering logs
+                    string previewText = textData.Length > 100 ? textData.Substring(0, 100) + "..." : textData;
+                    Debug.WriteLine($"✅ Sent text message: {previewText}");
+                }
+                else
+                {
+                    Debug.WriteLine("❌ No connected clients to send text to");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"❌ Error sending text to clients: {ex.Message}");
+            }
+            
+            return Task.CompletedTask;
+        }
 
         public void Dispose()
         {
